@@ -123,17 +123,8 @@ pub fn run_benchmark() {
     let mut avx2_output: Vec<i32> = vec![0; m * n];
 
     // Warmup
-    unsafe {
-        ffi::ternary_gemm_avx2_packed(
-            packed_ternary_weights.as_ptr(),
-            int8_acts.as_ptr(),
-            avx2_output.as_mut_ptr(),
-            m, n, k
-        );
-    }
-
-    let start = Instant::now();
-    for _ in 0..num_runs {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
         unsafe {
             ffi::ternary_gemm_avx2_packed(
                 packed_ternary_weights.as_ptr(),
@@ -141,6 +132,21 @@ pub fn run_benchmark() {
                 avx2_output.as_mut_ptr(),
                 m, n, k
             );
+        }
+    }
+
+    let start = Instant::now();
+    for _ in 0..num_runs {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                ffi::ternary_gemm_avx2_packed(
+                    packed_ternary_weights.as_ptr(),
+                    int8_acts.as_ptr(),
+                    avx2_output.as_mut_ptr(),
+                    m, n, k
+                );
+            }
         }
     }
     let avx2_duration = start.elapsed();

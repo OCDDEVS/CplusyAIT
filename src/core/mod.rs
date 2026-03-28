@@ -10,6 +10,7 @@ use std::ffi::c_void;
 pub struct Runtime {
     pub thread_pool: rayon::ThreadPool,
     pub mapped_memory_pool: *mut c_void, // Pointer to mmaped NVMe storage
+    pub preferred_device: Device,
 }
 
 impl Runtime {
@@ -17,10 +18,30 @@ impl Runtime {
         // Initialize an optimal thread pool based on CPU cores
         let pool = rayon::ThreadPoolBuilder::new().build().unwrap();
 
+        // Automatically detect and acquire best available compute device
+        let preferred_device = Self::get_best_device();
+
         Runtime {
             thread_pool: pool,
             mapped_memory_pool: std::ptr::null_mut(),
+            preferred_device,
         }
+    }
+
+    /// Detects if CUDA or Metal is available and returns the Device. Falls back to CPU.
+    pub fn get_best_device() -> Device {
+        if candle_core::utils::cuda_is_available() {
+            println!("Runtime detected NVIDIA GPU (CUDA). Initializing heterogeneous pipeline.");
+            return Device::new_cuda(0).unwrap_or(Device::Cpu);
+        }
+
+        if candle_core::utils::metal_is_available() {
+            println!("Runtime detected Apple Silicon (Metal). Initializing heterogeneous pipeline.");
+            return Device::new_metal(0).unwrap_or(Device::Cpu);
+        }
+
+        println!("No GPU detected. Running pure CPU optimized AVX2 pipeline.");
+        Device::Cpu
     }
 
     /// Initializes the EverMemOS architecture for the local memory lifecycle.

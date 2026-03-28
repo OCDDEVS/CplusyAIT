@@ -79,7 +79,8 @@ impl TernarySTEModel {
     }
 
     /// True Forward pass using the highly optimized C++ AVX2 Kernel.
-    /// Completely removes the FP32 naive simulation.
+    /// Completely removes the FP32 naive simulation. Falls back to scalar ternary
+    /// if the hardware does not support AVX2.
     pub fn forward_avx2(&mut self, activations_f32: &[f32], output_f32: &mut [f32]) {
         self.quantize_and_pack();
 
@@ -117,16 +118,24 @@ impl TernarySTEModel {
 
         let mut output_int32 = vec![0i32; self.n * self.m]; // N x M
 
-        unsafe {
-            // Weights (N x K) * Activations (K x M) = Output (N x M)
-            // m=N, k=K, n=M.
-            ffi::ternary_gemm_avx2_packed(
-                self.packed_quantized_weights.as_ptr(),
-                activations_int8.as_ptr(),
-                output_int32.as_mut_ptr(),
-                self.n, self.m, self.k
-            );
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                // Weights (N x K) * Activations (K x M) = Output (N x M)
+                // m=N, k=K, n=M.
+                ffi::ternary_gemm_avx2_packed(
+                    self.packed_quantized_weights.as_ptr(),
+                    activations_int8.as_ptr(),
+                    output_int32.as_mut_ptr(),
+                    self.n, self.m, self.k
+                );
+            }
+        } else {
+            self.scalar_fallback(&activations_int8, &mut output_int32);
         }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        self.scalar_fallback(&activations_int8, &mut output_int32);
 
         // 3. Dequantize Int32 back to FP32.
         // Out_f32 = Out_i32 * gamma * act_scale
@@ -138,6 +147,27 @@ impl TernarySTEModel {
                 // Out_i32 is mapped as (j, i) since it's N x M
                 let val_i32 = output_int32[j * self.m + i];
                 output_f32[i * self.n + j] = (val_i32 as f32) * dequant_scale;
+            }
+        }
+    }
+
+    /// Fallback scalar implementation for non-x86_64 or non-AVX2 machines
+    fn scalar_fallback(&self, acts_int8: &[i8], out_int32: &mut [i32]) {
+        for row in 0..self.n {
+            for col in 0..self.m {
+                let mut acc = 0;
+                for i in 0..self.k {
+                    let weight_idx = row * self.k + i;
+                    let byte_idx = weight_idx / 4;
+                    let bit_offset = (weight_idx % 4) * 2;
+                    let w_val = (self.packed_quantized_weights[byte_idx] >> bit_offset) & 0x03;
+
+                    let act = acts_int8[i * self.m + col];
+
+                    if w_val == 1 { acc += act as i32; }
+                    else if w_val == 2 { acc -= act as i32; }
+                }
+                out_int32[row * self.m + col] = acc;
             }
         }
     }

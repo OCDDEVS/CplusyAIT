@@ -19,12 +19,12 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    pub fn new(hidden_dim: usize, vocab_size: usize) -> Self {
+    pub fn new(hidden_dim: usize, vocab_size: usize, compute_device: Device) -> Self {
         let top_k = 2;
         let num_heads = 4;
-        let device = Device::Cpu;
         let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
+        // Initialize MHA on the optimal compute_device (GPU if available)
+        let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &compute_device);
 
         Self {
             hidden_dim,
@@ -35,20 +35,25 @@ impl TransformerBlock {
         }
     }
 
-    /// True Forward pass: MHA -> MSA Route -> Memory Gather -> AVX2 Ternary FFN
+    /// True Forward pass: MHA (Heterogeneous) -> MSA Route -> Memory Gather -> AVX2 Ternary FFN
     pub fn forward(
         &mut self,
         query_embedding: &[f32],
         memory_manager: &MemoryManager,
         output_logits: &mut [f32],
-        position: usize
+        position: usize,
+        compute_device: &Device,
     ) -> Vec<i32> {
-        // 1. Self-Attention (Using Candle Tensor Math)
-        let device = Device::Cpu;
-        let x_tensor = Tensor::from_slice(query_embedding, (1, 1, self.hidden_dim), &device).unwrap();
+        // 1. Self-Attention (Using Heterogeneous Compute)
+        // We move the tensor to the GPU (if available) for standard FP32 math.
+        let x_tensor = Tensor::from_slice(query_embedding, (1, 1, self.hidden_dim), compute_device).unwrap();
+
         // Pass position index for Document-wise RoPE
         let mha_output = self.mha.forward(&x_tensor, &[position]).unwrap();
-        let mha_vec = mha_output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        // Transfer data BACK to the CPU for the sparse MSA Routing and highly optimized AVX2 execution.
+        let mha_output_cpu = mha_output.to_device(&Device::Cpu).unwrap();
+        let mha_vec = mha_output_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
         let top_k = 2;
         let mut top_k_indices = vec![-1; top_k];
@@ -98,8 +103,11 @@ impl TransformerBlock {
 pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
     println!("\n--- Starting Continuous Local Learning (MSA + EverMemOS) ---");
 
+    let mut runtime = crate::core::Runtime::new();
+    let compute_device = runtime.preferred_device.clone();
+
     let hidden_dim = 128;
-    let mut transformer = TransformerBlock::new(hidden_dim, vocab_size);
+    let mut transformer = TransformerBlock::new(hidden_dim, vocab_size, compute_device.clone());
     let mut memory_manager = MemoryManager::new(hidden_dim);
     let mut embedding_layer = EmbeddingLayer::new(vocab_size, hidden_dim);
 
@@ -123,9 +131,9 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
             let mut current_embedding = vec![0.0; hidden_dim];
             embedding_layer.forward(current_token, &mut current_embedding);
 
-            // 1. True Forward Pass: MHA (Candle) -> MSA Router -> Memory Paging -> AVX2 SIMD Ternary Kernel
+            // 1. True Forward Pass: Heterogeneous MHA -> MSA Router -> Memory Paging -> AVX2 SIMD Ternary Kernel
             let mut logits = vec![0.0; vocab_size];
-            transformer.forward(&current_embedding, &memory_manager, &mut logits, i); // Pass 'i' as document position for RoPE
+            transformer.forward(&current_embedding, &memory_manager, &mut logits, i, &compute_device);
 
             // 2. Compute Softmax & Cross-Entropy Loss
             let mut max_logit = f32::MIN;

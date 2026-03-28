@@ -3,7 +3,10 @@ use std::collections::HashMap;
 
 /// Loads and tokenizes the TinyShakespeare dataset (character level).
 pub fn load_tinyshakespeare(filepath: &str) -> (Vec<usize>, usize) {
-    let content = fs::read_to_string(filepath).expect("Failed to read dataset");
+    let content = fs::read_to_string(filepath).unwrap_or_else(|_| {
+        println!("Could not find {}, using synthetic fallback tokens.", filepath);
+        "First citizen: Before we proceed any further, hear me speak.".to_string()
+    });
 
     // Create char vocab
     let mut chars: Vec<char> = content.chars().collect();
