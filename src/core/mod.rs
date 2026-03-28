@@ -1,3 +1,8 @@
+pub mod attention;
+pub mod checkpoint;
+
+pub use candle_core::{Tensor, Device, DType};
+pub use candle_nn::{Linear, Module};
 use std::ffi::c_void;
 
 /// The Core Orchestration Runtime
@@ -22,4 +27,37 @@ impl Runtime {
     pub fn initialize_memory_os(&mut self) {
         println!("Initializing EverMemOS (Episodic Trace Formation -> Semantic Consolidation)");
     }
+}
+
+/// Safe wrapper for the AVX2 Fast Ternary GEMM C++ Kernel.
+/// Accepts Candle Tensors, extracts their pointers, executes AVX2 SIMD, and returns a new Tensor.
+pub fn run_avx2_ternary_gemm(
+    packed_weights: &Tensor, // Shape (M, K/4) - uint8
+    activations: &Tensor,    // Shape (K, N) - u8 (we cast to i8 internally since candle lacks i8)
+    m: usize, k: usize, n: usize
+) -> candle_core::Result<Tensor> {
+
+    // Ensure tensors are contiguous on the CPU
+    let w_cont = packed_weights.contiguous()?;
+    let a_cont = activations.contiguous()?;
+
+    let device = Device::Cpu;
+    let mut output_vec = vec![0i32; m * n];
+
+    // Extract raw pointers securely
+    // Candle doesn't support i8 natively, so we pass as u8 and cast pointers to i8 for C++.
+    let w_vec = w_cont.to_vec1::<u8>()?;
+    let a_vec = a_cont.to_vec1::<u8>()?;
+
+    unsafe {
+        crate::ffi::ternary_gemm_avx2_packed(
+            w_vec.as_ptr(),
+            a_vec.as_ptr() as *const i8,
+            output_vec.as_mut_ptr(),
+            m, n, k
+        );
+    }
+
+    // Convert back into a Candle Tensor
+    Tensor::from_vec(output_vec, (m, n), &device)
 }

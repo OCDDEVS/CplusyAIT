@@ -2,12 +2,17 @@ use crate::ffi;
 use crate::benchmark::ste::TernarySTEModel;
 use crate::benchmark::embedding::EmbeddingLayer;
 use crate::memory::MemoryManager;
+use crate::core::attention::MultiHeadAttention;
+use candle_core::{Device, Tensor};
+use candle_nn::{VarBuilder, VarMap};
 
 /// Real Transformer Block that integrates:
-/// 1. Real Memory Sparse Attention (MSA) Routing & Working Memory Gathering
-/// 2. 1.58-bit Ternary Feed-Forward Network (Executing real AVX2 SIMD)
+/// 1. Multi-Head Self Attention (with Document-wise RoPE) using `candle-core`
+/// 2. Real Memory Sparse Attention (MSA) Routing & Working Memory Gathering
+/// 3. 1.58-bit Ternary Feed-Forward Network (Executing real AVX2 SIMD)
 pub struct TransformerBlock {
     pub hidden_dim: usize,
+    pub mha: MultiHeadAttention,
     pub ffn: TernarySTEModel,
     pub working_memory_buffer: Vec<f32>,
     pub combined_state: Vec<f32>,
@@ -16,29 +21,43 @@ pub struct TransformerBlock {
 impl TransformerBlock {
     pub fn new(hidden_dim: usize, vocab_size: usize) -> Self {
         let top_k = 2;
+        let num_heads = 4;
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
+
         Self {
             hidden_dim,
+            mha: MultiHeadAttention::new(vb, hidden_dim, num_heads).expect("Failed to init MHA"),
             ffn: TernarySTEModel::new(1, hidden_dim, vocab_size), // Out to vocab size
             working_memory_buffer: vec![0.0; top_k * hidden_dim],
             combined_state: vec![0.0; hidden_dim],
         }
     }
 
-    /// True Forward pass: MSA Route -> Memory Gather -> AVX2 Ternary FFN
+    /// True Forward pass: MHA -> MSA Route -> Memory Gather -> AVX2 Ternary FFN
     pub fn forward(
         &mut self,
         query_embedding: &[f32],
         memory_manager: &MemoryManager,
-        output_logits: &mut [f32]
+        output_logits: &mut [f32],
+        position: usize
     ) -> Vec<i32> {
+        // 1. Self-Attention (Using Candle Tensor Math)
+        let device = Device::Cpu;
+        let x_tensor = Tensor::from_slice(query_embedding, (1, 1, self.hidden_dim), &device).unwrap();
+        // Pass position index for Document-wise RoPE
+        let mha_output = self.mha.forward(&x_tensor, &[position]).unwrap();
+        let mha_vec = mha_output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
         let top_k = 2;
         let mut top_k_indices = vec![-1; top_k];
 
-        // 1. MSA Retrieval: Route query to Top-K MemScenes
+        // 2. MSA Retrieval: Route query to Top-K MemScenes
         if !memory_manager.routing_keys_vram.is_empty() {
             unsafe {
                 ffi::msa_route_top_k(
-                    query_embedding.as_ptr(),
+                    mha_vec.as_ptr(),
                     memory_manager.routing_keys_vram.as_ptr(),
                     top_k_indices.as_mut_ptr(),
                     memory_manager.scenes.len(),
@@ -57,14 +76,14 @@ impl TransformerBlock {
             }
         }
 
-        // 3. Integrate Working Memory with Token Query Embedding
-        // Real implementation: We sum the token embedding with the gathered context chunks.
+        // 3. Integrate Working Memory with Attended Token State
+        // Real implementation: We sum the MHA output with the gathered context chunks.
         for i in 0..self.hidden_dim {
             let mut context_sum = 0.0;
             for k_idx in 0..top_k {
                 context_sum += self.working_memory_buffer[k_idx * self.hidden_dim + i];
             }
-            self.combined_state[i] = query_embedding[i] + context_sum;
+            self.combined_state[i] = mha_vec[i] + context_sum;
         }
 
         // 4. Actual AVX2 FFN Forward Pass:
@@ -104,9 +123,9 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
             let mut current_embedding = vec![0.0; hidden_dim];
             embedding_layer.forward(current_token, &mut current_embedding);
 
-            // 1. True Forward Pass: MSA Router -> Memory Paging -> AVX2 SIMD Ternary Kernel
+            // 1. True Forward Pass: MHA (Candle) -> MSA Router -> Memory Paging -> AVX2 SIMD Ternary Kernel
             let mut logits = vec![0.0; vocab_size];
-            transformer.forward(&current_embedding, &memory_manager, &mut logits);
+            transformer.forward(&current_embedding, &memory_manager, &mut logits, i); // Pass 'i' as document position for RoPE
 
             // 2. Compute Softmax & Cross-Entropy Loss
             let mut max_logit = f32::MIN;

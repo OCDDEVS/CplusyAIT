@@ -11,9 +11,6 @@ fn main() {
     let mut runtime = core::Runtime::new();
     runtime.initialize_memory_os();
 
-    // Example run loop
-    println!("Ready to achieve 100 Tokens/s on an 8GB RAM CPU boundary!");
-
     // Run the benchmarking suite to compare FP32 vs Ternary
     benchmark::run_benchmark();
 

@@ -74,6 +74,8 @@ pub fn cosine_similarity(v1: &[f32], v2: &[f32]) -> f32 {
     dot / (norm1.sqrt() * norm2.sqrt())
 }
 
+pub mod paging;
+
 /// EverMemOS Memory Manager: Orchestrates Working Memory vs Long-Term Memory.
 /// Maintains the contiguous array of Router Keys (Centroids) for fast C++ MSA Retrieval.
 pub struct MemoryManager {
@@ -82,6 +84,9 @@ pub struct MemoryManager {
 
     // Contiguous memory buffer to hold all centroid vectors for fast C++ access
     pub routing_keys_vram: Vec<f32>,
+
+    // The actual Memory Pager bridging RAM and SSD via mmap
+    pub pager: Option<paging::DiskMemoryPager>,
 }
 
 impl MemoryManager {
@@ -90,7 +95,15 @@ impl MemoryManager {
             scenes: Vec::new(),
             vector_dim,
             routing_keys_vram: Vec::new(),
+            pager: None, // Can be initialized externally
         }
+    }
+
+    pub fn enable_disk_paging(&mut self, path: &str, max_blocks: usize) -> std::io::Result<()> {
+        let block_size = self.vector_dim * std::mem::size_of::<f32>();
+        let pager = paging::DiskMemoryPager::new(path, max_blocks, block_size)?;
+        self.pager = Some(pager);
+        Ok(())
     }
 
     /// Phase I & II: Process a new interaction, form a MemCell, and Semantically Consolidate it.
