@@ -2,27 +2,30 @@ use crate::ffi;
 use crate::benchmark::ste::TernarySTEModel;
 use crate::benchmark::embedding::EmbeddingLayer;
 use crate::memory::MemoryManager;
-use crate::core::attention::MultiHeadAttention;
+use crate::core::mamba::MambaBlock;
 use candle_core::{Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 
 /// Real Transformer Block that integrates:
-/// 1. Real Memory Sparse Attention (MSA) Routing & Working Memory Gathering
-/// 2. 1.58-bit Ternary Feed-Forward Network (Executing real AVX2 SIMD)
-/// Note: The MHA module has been moved into an Arc<Mutex> in the training loop
+/// 1. Mamba Selective State-Space Model ($O(N)$ linear context) using `candle-core`
+/// 2. Real Memory Sparse Attention (MSA) Routing & Working Memory Gathering
+/// 3. 1.58-bit Ternary Feed-Forward Network (Executing real AVX2 SIMD)
+/// Note: The Mamba module has been moved into an Arc<Mutex> in the training loop
 /// to support true Thread-Spawned Pipeline Parallelism.
 pub struct TransformerBlock {
     pub hidden_dim: usize,
+    pub state_dim: usize,
     pub ffn: TernarySTEModel,
     pub working_memory_buffer: Vec<f32>,
     pub combined_state: Vec<f32>,
 }
 
 impl TransformerBlock {
-    pub fn new(hidden_dim: usize, vocab_size: usize) -> Self {
+    pub fn new(hidden_dim: usize, state_dim: usize, vocab_size: usize) -> Self {
         let top_k = 2;
         Self {
             hidden_dim,
+            state_dim,
             ffn: TernarySTEModel::new(1, hidden_dim, vocab_size), // Out to vocab size
             working_memory_buffer: vec![0.0; top_k * hidden_dim],
             combined_state: vec![0.0; hidden_dim],
@@ -105,14 +108,14 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
     let compute_device = runtime.preferred_device.clone();
 
     let hidden_dim = 128;
-    let mut transformer = TransformerBlock::new(hidden_dim, vocab_size);
+    let state_dim = 16;
+    let mut transformer = TransformerBlock::new(hidden_dim, state_dim, vocab_size);
     let mut memory_manager = MemoryManager::new(hidden_dim);
     let mut embedding_layer = EmbeddingLayer::new(vocab_size, hidden_dim);
 
-    let num_heads = 4;
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &compute_device);
-    let mha = MultiHeadAttention::new(vb, hidden_dim, num_heads).expect("Failed to init MHA");
+    let mamba = MambaBlock::new(vb, hidden_dim, state_dim).expect("Failed to init Mamba");
 
     let learning_rate = 0.05;
     let context_window = 16; // Context chunk size
@@ -124,14 +127,19 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
     use std::thread;
 
     // To achieve true pipeline parallelism, we set up channels between the GPU thread and CPU thread
-    // The GPU thread calculates Attention(T) and pushes to the CPU.
-    // The CPU thread reads from the GPU and calculates FFN(T-1) simultaneously.
-
     let (tx_gpu_out, rx_cpu_in) = mpsc::channel::<Vec<f32>>();
 
-    // We wrap the MHA block and device into Arc/Mutex to be safely sent to the background thread.
-    let mha_shared = Arc::new(Mutex::new(mha));
+    // We wrap the Mamba block, recurrent state, and device into Arc/Mutex for the background thread.
+    let mamba_shared = Arc::new(Mutex::new(mamba));
     let device_shared = Arc::new(compute_device.clone());
+    let recurrent_state = Arc::new(Mutex::new(
+        Tensor::zeros((1, hidden_dim, state_dim), candle_core::DType::F32, &compute_device).unwrap()
+    ));
+
+    // Track if there is a pending token in the CPU pipeline to avoid initial stall
+    let mut pipeline_primed = false;
+    let mut next_token_expected = 0;
+    let mut current_token_saved = 0;
 
     // Continuously read the user interaction stream and train using proper Cross-Entropy and Backprop
     let max_tokens = std::cmp::min(1000, tokens.len().saturating_sub(1));
@@ -149,88 +157,93 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
             embedding_layer.forward(current_token, &mut current_embedding);
 
             // -----------------------------------------------------------------
-            // STAGE 1: ASYNCHRONOUS GPU PIPELINE (Thread Spawn)
+            // STAGE 1: ASYNCHRONOUS GPU PIPELINE (Thread Spawn Token T)
             // -----------------------------------------------------------------
-            // GPU Thread natively executes the MHA block (FP32 Dense Matrix multiplication)
-            // It runs concurrently with the previous loop's CPU execution.
-
-            let mha_thread = mha_shared.clone();
+            // GPU Thread computes Mamba O(N) selective state-space dynamically.
+            let mamba_thread = mamba_shared.clone();
+            let state_thread = recurrent_state.clone();
             let dev_thread = device_shared.clone();
             let emb_thread = current_embedding.clone();
-            let pos_thread = i;
             let tx_thread = tx_gpu_out.clone();
             let dim_thread = hidden_dim;
 
             thread::spawn(move || {
                 let x_tensor = Tensor::from_slice(&emb_thread, (1, 1, dim_thread), &*dev_thread).unwrap();
-                let mha = mha_thread.lock().unwrap();
-                let mha_output = mha.forward(&x_tensor, &[pos_thread]).unwrap();
-                let mha_output_cpu = mha_output.to_device(&Device::Cpu).unwrap();
-                let out_vec = mha_output_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let mamba = mamba_thread.lock().unwrap();
+
+                // Read current state, compute forward pass, and save new recurrent state
+                let state_tensor = { state_thread.lock().unwrap().clone() };
+                let (mamba_output, new_state) = mamba.forward(&x_tensor, state_tensor).unwrap();
+                *state_thread.lock().unwrap() = new_state;
+
+                let mamba_output_cpu = mamba_output.to_device(&Device::Cpu).unwrap();
+                let out_vec = mamba_output_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+                // Send computed Token T state to CPU pipeline
                 tx_thread.send(out_vec).unwrap();
             });
 
-            // -----------------------------------------------------------------
-            // STAGE 2: ASYNCHRONOUS CPU PIPELINE (Main Thread)
-            // -----------------------------------------------------------------
-            // CPU Thread waits for the specific token's attended state and executes AVX2/Disk Paging
-            let mha_vec = rx_cpu_in.recv().unwrap();
+            // True Pipeline Parallelism: While the GPU works on Token T (Thread spawned above),
+            // the CPU immediately executes the MSA/AVX2 logic for Token T-1 if primed.
+            if pipeline_primed {
+                // -----------------------------------------------------------------
+                // STAGE 2: ASYNCHRONOUS CPU PIPELINE (Main Thread - Token T-1)
+                // -----------------------------------------------------------------
+                let mamba_vec_t_minus_1 = rx_cpu_in.recv().unwrap();
 
-            let mut logits = vec![0.0; vocab_size];
-            transformer.forward_stage2_cpu(&mha_vec, &memory_manager, &mut logits);
+                let mut logits = vec![0.0; vocab_size];
+                transformer.forward_stage2_cpu(&mamba_vec_t_minus_1, &memory_manager, &mut logits);
 
-            // 2. Compute Softmax & Cross-Entropy Loss
-            let mut max_logit = f32::MIN;
-            for &l in &logits {
-                if l > max_logit { max_logit = l; }
-            }
-            let mut sum_exp = 0.0;
-            let mut probs = vec![0.0; vocab_size];
-            for (j, &l) in logits.iter().enumerate() {
-                let p = (l - max_logit).exp();
-                probs[j] = p;
-                sum_exp += p;
-            }
-            for p in &mut probs {
-                *p /= sum_exp;
-            }
-
-            let loss = -probs[next_token].ln();
-            running_loss += loss;
-            steps += 1;
-
-            // 3. Compute Gradients for STE Backward Pass
-            // For cross-entropy + softmax, gradient of logits is (probs - target)
-            let mut d_logits = probs.clone();
-            d_logits[next_token] -= 1.0;
-
-            // Compute d_weights for the Ternary AVX2 Layer
-            // d_weights (N x K) = d_logits (N) * combined_state (K)
-            let mut d_weights = vec![0.0; hidden_dim * vocab_size];
-            for f in 0..hidden_dim {
-                for v in 0..vocab_size {
-                    d_weights[f * vocab_size + v] = transformer.combined_state[f] * d_logits[v];
+                // Compute Softmax & Cross-Entropy Loss for Token T-1
+                let mut max_logit = f32::MIN;
+                for &l in &logits {
+                    if l > max_logit { max_logit = l; }
                 }
-            }
-
-            // 4. Real Backward Pass
-            // Update Ternary Master Weights (STE)
-            transformer.ffn.backward_ste_update(&d_weights, learning_rate);
-
-            // Backpropagate error back to the embeddings:
-            // d_embedding (K) = W^T (K x N) * d_logits (N)
-            let mut d_embedding = vec![0.0; hidden_dim];
-            for f in 0..hidden_dim {
-                let mut sum_err = 0.0;
-                for v in 0..vocab_size {
-                    // Uses FP32 master weights for precise gradient backprop
-                    sum_err += transformer.ffn.master_weights[f * vocab_size + v] * d_logits[v];
+                let mut sum_exp = 0.0;
+                let mut probs = vec![0.0; vocab_size];
+                for (j, &l) in logits.iter().enumerate() {
+                    let p = (l - max_logit).exp();
+                    probs[j] = p;
+                    sum_exp += p;
                 }
-                d_embedding[f] = sum_err;
+                for p in &mut probs {
+                    *p /= sum_exp;
+                }
+
+                let loss = -probs[next_token_expected].ln();
+                running_loss += loss;
+                steps += 1;
+
+                // 3. Compute Gradients for STE Backward Pass
+                let mut d_logits = probs.clone();
+                d_logits[next_token_expected] -= 1.0;
+
+                let mut d_weights = vec![0.0; hidden_dim * vocab_size];
+                for f in 0..hidden_dim {
+                    for v in 0..vocab_size {
+                        d_weights[f * vocab_size + v] = transformer.combined_state[f] * d_logits[v];
+                    }
+                }
+
+                // Update Ternary Master Weights (STE)
+                transformer.ffn.backward_ste_update(&d_weights, learning_rate);
+
+                // Update Embedding Layer for Token T-1
+                let mut d_embedding = vec![0.0; hidden_dim];
+                for f in 0..hidden_dim {
+                    let mut sum_err = 0.0;
+                    for v in 0..vocab_size {
+                        sum_err += transformer.ffn.master_weights[f * vocab_size + v] * d_logits[v];
+                    }
+                    d_embedding[f] = sum_err;
+                }
+                embedding_layer.backward_update(current_token_saved, &d_embedding, learning_rate);
             }
 
-            // Update Real Embedding Layer
-            embedding_layer.backward_update(current_token, &d_embedding, learning_rate);
+            // Save state for the next CPU pipeline execution
+            pipeline_primed = true;
+            current_token_saved = current_token;
+            next_token_expected = next_token;
         }
 
         // 5. Semantic Consolidation (EverMemOS)

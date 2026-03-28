@@ -28,10 +28,22 @@ jobs:
       continue-on-error: true
 
     - name: Build (Release)
-      run: cargo build --release --verbose
+      run: |
+        if [ "$RUNNER_OS" == "macOS" ]; then
+          cargo build --release --verbose --features metal
+        else
+          cargo build --release --verbose
+        fi
+      shell: bash
 
     - name: Run Tests
-      run: cargo test --verbose
+      run: |
+        if [ "$RUNNER_OS" == "macOS" ]; then
+          cargo test --verbose --features metal
+        else
+          cargo test --verbose
+        fi
+      shell: bash
 
     - name: Run Benchmarks (CPU Only)
       run: cargo run --release -- --benchmark
