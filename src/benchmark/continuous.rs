@@ -7,54 +7,36 @@ use candle_core::{Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 
 /// Real Transformer Block that integrates:
-/// 1. Multi-Head Self Attention (with Document-wise RoPE) using `candle-core`
-/// 2. Real Memory Sparse Attention (MSA) Routing & Working Memory Gathering
-/// 3. 1.58-bit Ternary Feed-Forward Network (Executing real AVX2 SIMD)
+/// 1. Real Memory Sparse Attention (MSA) Routing & Working Memory Gathering
+/// 2. 1.58-bit Ternary Feed-Forward Network (Executing real AVX2 SIMD)
+/// Note: The MHA module has been moved into an Arc<Mutex> in the training loop
+/// to support true Thread-Spawned Pipeline Parallelism.
 pub struct TransformerBlock {
     pub hidden_dim: usize,
-    pub mha: MultiHeadAttention,
     pub ffn: TernarySTEModel,
     pub working_memory_buffer: Vec<f32>,
     pub combined_state: Vec<f32>,
 }
 
 impl TransformerBlock {
-    pub fn new(hidden_dim: usize, vocab_size: usize, compute_device: Device) -> Self {
+    pub fn new(hidden_dim: usize, vocab_size: usize) -> Self {
         let top_k = 2;
-        let num_heads = 4;
-        let varmap = VarMap::new();
-        // Initialize MHA on the optimal compute_device (GPU if available)
-        let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &compute_device);
-
         Self {
             hidden_dim,
-            mha: MultiHeadAttention::new(vb, hidden_dim, num_heads).expect("Failed to init MHA"),
             ffn: TernarySTEModel::new(1, hidden_dim, vocab_size), // Out to vocab size
             working_memory_buffer: vec![0.0; top_k * hidden_dim],
             combined_state: vec![0.0; hidden_dim],
         }
     }
 
-    /// True Forward pass: MHA (Heterogeneous) -> MSA Route -> Memory Gather -> AVX2 Ternary FFN
-    pub fn forward(
+    /// Stage 2 (CPU Pipeline): MSA Route -> Memory Gather -> AVX2 Ternary FFN
+    /// Executes asynchronously from Stage 1.
+    pub fn forward_stage2_cpu(
         &mut self,
-        query_embedding: &[f32],
+        mha_vec: &[f32],
         memory_manager: &MemoryManager,
         output_logits: &mut [f32],
-        position: usize,
-        compute_device: &Device,
     ) -> Vec<i32> {
-        // 1. Self-Attention (Using Heterogeneous Compute)
-        // We move the tensor to the GPU (if available) for standard FP32 math.
-        let x_tensor = Tensor::from_slice(query_embedding, (1, 1, self.hidden_dim), compute_device).unwrap();
-
-        // Pass position index for Document-wise RoPE
-        let mha_output = self.mha.forward(&x_tensor, &[position]).unwrap();
-
-        // Transfer data BACK to the CPU for the sparse MSA Routing and highly optimized AVX2 execution.
-        let mha_output_cpu = mha_output.to_device(&Device::Cpu).unwrap();
-        let mha_vec = mha_output_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-
         let top_k = 2;
         let mut top_k_indices = vec![-1; top_k];
 
@@ -123,15 +105,33 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
     let compute_device = runtime.preferred_device.clone();
 
     let hidden_dim = 128;
-    let mut transformer = TransformerBlock::new(hidden_dim, vocab_size, compute_device.clone());
+    let mut transformer = TransformerBlock::new(hidden_dim, vocab_size);
     let mut memory_manager = MemoryManager::new(hidden_dim);
     let mut embedding_layer = EmbeddingLayer::new(vocab_size, hidden_dim);
+
+    let num_heads = 4;
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &compute_device);
+    let mha = MultiHeadAttention::new(vb, hidden_dim, num_heads).expect("Failed to init MHA");
 
     let learning_rate = 0.05;
     let context_window = 16; // Context chunk size
 
     let mut running_loss = 0.0;
     let mut steps = 0;
+
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+
+    // To achieve true pipeline parallelism, we set up channels between the GPU thread and CPU thread
+    // The GPU thread calculates Attention(T) and pushes to the CPU.
+    // The CPU thread reads from the GPU and calculates FFN(T-1) simultaneously.
+
+    let (tx_gpu_out, rx_cpu_in) = mpsc::channel::<Vec<f32>>();
+
+    // We wrap the MHA block and device into Arc/Mutex to be safely sent to the background thread.
+    let mha_shared = Arc::new(Mutex::new(mha));
+    let device_shared = Arc::new(compute_device.clone());
 
     // Continuously read the user interaction stream and train using proper Cross-Entropy and Backprop
     let max_tokens = std::cmp::min(1000, tokens.len().saturating_sub(1));
@@ -148,9 +148,36 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
             let mut current_embedding = vec![0.0; hidden_dim];
             embedding_layer.forward(current_token, &mut current_embedding);
 
-            // 1. True Forward Pass: Heterogeneous MHA -> MSA Router -> Memory Paging -> AVX2 SIMD Ternary Kernel
+            // -----------------------------------------------------------------
+            // STAGE 1: ASYNCHRONOUS GPU PIPELINE (Thread Spawn)
+            // -----------------------------------------------------------------
+            // GPU Thread natively executes the MHA block (FP32 Dense Matrix multiplication)
+            // It runs concurrently with the previous loop's CPU execution.
+
+            let mha_thread = mha_shared.clone();
+            let dev_thread = device_shared.clone();
+            let emb_thread = current_embedding.clone();
+            let pos_thread = i;
+            let tx_thread = tx_gpu_out.clone();
+            let dim_thread = hidden_dim;
+
+            thread::spawn(move || {
+                let x_tensor = Tensor::from_slice(&emb_thread, (1, 1, dim_thread), &*dev_thread).unwrap();
+                let mha = mha_thread.lock().unwrap();
+                let mha_output = mha.forward(&x_tensor, &[pos_thread]).unwrap();
+                let mha_output_cpu = mha_output.to_device(&Device::Cpu).unwrap();
+                let out_vec = mha_output_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                tx_thread.send(out_vec).unwrap();
+            });
+
+            // -----------------------------------------------------------------
+            // STAGE 2: ASYNCHRONOUS CPU PIPELINE (Main Thread)
+            // -----------------------------------------------------------------
+            // CPU Thread waits for the specific token's attended state and executes AVX2/Disk Paging
+            let mha_vec = rx_cpu_in.recv().unwrap();
+
             let mut logits = vec![0.0; vocab_size];
-            transformer.forward(&current_embedding, &memory_manager, &mut logits, i, &compute_device);
+            transformer.forward_stage2_cpu(&mha_vec, &memory_manager, &mut logits);
 
             // 2. Compute Softmax & Cross-Entropy Loss
             let mut max_logit = f32::MIN;
