@@ -50,4 +50,13 @@ extern "C" {
         num_blocks: size_t,
         mapped_memory_pool: *mut c_void,
     );
+
+    /// Gathers Top-K MemScene centroids into a continuous working memory buffer
+    pub fn gather_working_memory(
+        top_k_indices: *const int32_t,
+        k: size_t,
+        long_term_memory_pool: *const c_float,
+        vector_dim: size_t,
+        working_memory_out: *mut c_float,
+    );
 }

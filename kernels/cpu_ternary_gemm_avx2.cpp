@@ -29,21 +29,29 @@ extern "C" {
         size_t k
     ) {
         // We will process N columns in chunks of 8 (since an AVX2 __m256i register holds 8 x 32-bit ints).
-        // This requires N to be a multiple of 8 for simplicity in this benchmark.
+        // For N values not perfectly divisible by 8, we handle the remainder sequentially.
 
-        // Ensure N is a multiple of 8
-        if (n % 8 != 0) return;
+        size_t num_chunks = n / 8;
+        size_t remainder = n % 8;
 
         // Loop ordering: M -> K -> N for cache-friendly access to activations (which are K x N).
         // For a given row M, we accumulate into the N outputs.
         for (size_t row = 0; row < m; ++row) {
 
-            // Initialize the accumulator for the current row (N elements)
-            // We use an array of __m256i to hold the N outputs.
-            size_t num_chunks = n / 8;
-            __m256i* acc = (__m256i*) _mm_malloc(num_chunks * sizeof(__m256i), 32);
-            for (size_t c = 0; c < num_chunks; ++c) {
-                acc[c] = _mm256_setzero_si256(); // Initialize to 0
+            // Initialize the SIMD accumulator for the chunks
+            __m256i* acc = nullptr;
+            if (num_chunks > 0) {
+                acc = (__m256i*) _mm_malloc(num_chunks * sizeof(__m256i), 32);
+                for (size_t c = 0; c < num_chunks; ++c) {
+                    acc[c] = _mm256_setzero_si256(); // Initialize to 0
+                }
+            }
+
+            // Initialize scalar accumulator for the remainder
+            int32_t* acc_rem = nullptr;
+            if (remainder > 0) {
+                acc_rem = new int32_t[remainder];
+                for (size_t r = 0; r < remainder; ++r) acc_rem[r] = 0;
             }
 
             // Iterate over the K dimension (input features)
@@ -65,30 +73,47 @@ extern "C" {
                 // We iterate over the N dimension in chunks of 8.
                 const int8_t* act_row = &activations[i * n];
 
+                // SIMD Path for full chunks
                 for (size_t c = 0; c < num_chunks; ++c) {
                     // Load 8 contiguous 8-bit activations from memory (64 bits)
-                    // We load them into a 128-bit register first.
                     __m128i act_8 = _mm_loadl_epi64((const __m128i*)&act_row[c * 8]);
 
                     // Sign-extend the 8x 8-bit ints to 8x 32-bit ints in a 256-bit register.
                     __m256i act_32 = _mm256_cvtepi8_epi32(act_8);
 
-                    // Branchless Add/Sub based on the extracted 2-bit weight.
-                    // 01 = +1 (add), 10 = -1 (subtract)
+                    // Branchless Add/Sub
                     if (weight_val == 1) { // Add
                         acc[c] = _mm256_add_epi32(acc[c], act_32);
                     } else if (weight_val == 2) { // Subtract
                         acc[c] = _mm256_sub_epi32(acc[c], act_32);
                     }
                 }
+
+                // Scalar Path for the remainder
+                for (size_t r = 0; r < remainder; ++r) {
+                    int8_t act = act_row[num_chunks * 8 + r];
+                    if (weight_val == 1) {
+                        acc_rem[r] += act;
+                    } else if (weight_val == 2) {
+                        acc_rem[r] -= act;
+                    }
+                }
             }
 
             // Write the accumulated 32-bit results back to the output memory
-            for (size_t c = 0; c < num_chunks; ++c) {
-                _mm256_storeu_si256((__m256i*)&output[row * n + c * 8], acc[c]);
+            if (num_chunks > 0) {
+                for (size_t c = 0; c < num_chunks; ++c) {
+                    _mm256_storeu_si256((__m256i*)&output[row * n + c * 8], acc[c]);
+                }
+                _mm_free(acc);
             }
 
-            _mm_free(acc);
+            if (remainder > 0) {
+                for (size_t r = 0; r < remainder; ++r) {
+                    output[row * n + num_chunks * 8 + r] = acc_rem[r];
+                }
+                delete[] acc_rem;
+            }
         }
     }
 

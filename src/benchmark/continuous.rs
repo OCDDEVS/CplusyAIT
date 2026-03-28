@@ -1,28 +1,33 @@
 use crate::ffi;
 use crate::benchmark::ste::TernarySTEModel;
+use crate::benchmark::embedding::EmbeddingLayer;
 use crate::memory::MemoryManager;
-use rand::Rng;
 
-/// Simulates a full Transformer Block that integrates:
-/// 1. Memory Sparse Attention (MSA) Retrieval
-/// 2. 1.58-bit Ternary Feed-Forward Network
+/// Real Transformer Block that integrates:
+/// 1. Real Memory Sparse Attention (MSA) Routing & Working Memory Gathering
+/// 2. 1.58-bit Ternary Feed-Forward Network (Executing real AVX2 SIMD)
 pub struct TransformerBlock {
     pub hidden_dim: usize,
     pub ffn: TernarySTEModel,
+    pub working_memory_buffer: Vec<f32>,
+    pub combined_state: Vec<f32>,
 }
 
 impl TransformerBlock {
     pub fn new(hidden_dim: usize, vocab_size: usize) -> Self {
+        let top_k = 2;
         Self {
             hidden_dim,
-            ffn: TernarySTEModel::new(1, hidden_dim, vocab_size), // Output maps back to vocab size for prediction
+            ffn: TernarySTEModel::new(1, hidden_dim, vocab_size), // Out to vocab size
+            working_memory_buffer: vec![0.0; top_k * hidden_dim],
+            combined_state: vec![0.0; hidden_dim],
         }
     }
 
-    /// Forward pass including MSA Routing
+    /// True Forward pass: MSA Route -> Memory Gather -> AVX2 Ternary FFN
     pub fn forward(
         &mut self,
-        query: &[f32],
+        query_embedding: &[f32],
         memory_manager: &MemoryManager,
         output_logits: &mut [f32]
     ) -> Vec<i32> {
@@ -33,19 +38,38 @@ impl TransformerBlock {
         if !memory_manager.routing_keys_vram.is_empty() {
             unsafe {
                 ffi::msa_route_top_k(
-                    query.as_ptr(),
+                    query_embedding.as_ptr(),
                     memory_manager.routing_keys_vram.as_ptr(),
                     top_k_indices.as_mut_ptr(),
                     memory_manager.scenes.len(),
                     memory_manager.vector_dim,
                     top_k
                 );
+
+                // 2. Memory Paging: Gather the actual clustered MemScene centroids
+                ffi::gather_working_memory(
+                    top_k_indices.as_ptr(),
+                    top_k,
+                    memory_manager.routing_keys_vram.as_ptr(), // The continuous block of all centroids
+                    memory_manager.vector_dim,
+                    self.working_memory_buffer.as_mut_ptr()
+                );
             }
         }
 
-        // 2. FFN Forward Pass
-        // In reality, this concatenates retrieved KV cache. Here we pass the query to the FFN.
-        self.ffn.forward_naive(query, output_logits);
+        // 3. Integrate Working Memory with Token Query Embedding
+        // Real implementation: We sum the token embedding with the gathered context chunks.
+        for i in 0..self.hidden_dim {
+            let mut context_sum = 0.0;
+            for k_idx in 0..top_k {
+                context_sum += self.working_memory_buffer[k_idx * self.hidden_dim + i];
+            }
+            self.combined_state[i] = query_embedding[i] + context_sum;
+        }
+
+        // 4. Actual AVX2 FFN Forward Pass:
+        // Pushes the integrated state through the 1.58-bit 2-bit packed Ternary kernel
+        self.ffn.forward_avx2(&self.combined_state, output_logits);
 
         top_k_indices
     }
@@ -58,22 +82,16 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
     let hidden_dim = 128;
     let mut transformer = TransformerBlock::new(hidden_dim, vocab_size);
     let mut memory_manager = MemoryManager::new(hidden_dim);
+    let mut embedding_layer = EmbeddingLayer::new(vocab_size, hidden_dim);
 
     let learning_rate = 0.05;
-    let context_window = 16; // Simulated short-term context window
-
-    // Fake embedding matrix (in a real model, this is trained too)
-    let mut rng = rand::thread_rng();
-    let embedding_matrix: Vec<f32> = (0..(vocab_size * hidden_dim))
-        .map(|_| rng.gen_range(-0.1..0.1))
-        .collect();
+    let context_window = 16; // Context chunk size
 
     let mut running_loss = 0.0;
     let mut steps = 0;
 
-    // Simulate continuously reading the user interaction stream
+    // Continuously read the user interaction stream and train using proper Cross-Entropy and Backprop
     for chunk_start in (0..1000).step_by(context_window) { // Train on first 1000 tokens
-        let mut episode_text = String::new();
 
         for i in 0..context_window {
             let idx = chunk_start + i;
@@ -82,13 +100,13 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
             let current_token = tokens[idx];
             let next_token = tokens[idx + 1];
 
-            // Get embedding for current token
-            let start = current_token * hidden_dim;
-            let current_embedding = &embedding_matrix[start..start + hidden_dim];
+            // Get proper embedding vector for current token
+            let mut current_embedding = vec![0.0; hidden_dim];
+            embedding_layer.forward(current_token, &mut current_embedding);
 
-            // 1. Forward Pass (MSA Retrieval + Ternary FFN)
+            // 1. True Forward Pass: MSA Router -> Memory Paging -> AVX2 SIMD Ternary Kernel
             let mut logits = vec![0.0; vocab_size];
-            let top_k_scenes = transformer.forward(current_embedding, &memory_manager, &mut logits);
+            transformer.forward(&current_embedding, &memory_manager, &mut logits);
 
             // 2. Compute Softmax & Cross-Entropy Loss
             let mut max_logit = f32::MIN;
@@ -115,24 +133,43 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
             let mut d_logits = probs.clone();
             d_logits[next_token] -= 1.0;
 
-            // d_weights = A^T * d_logits (where A is current_embedding)
+            // Compute d_weights for the Ternary AVX2 Layer
+            // d_weights (N x K) = d_logits (N) * combined_state (K)
             let mut d_weights = vec![0.0; hidden_dim * vocab_size];
             for f in 0..hidden_dim {
                 for v in 0..vocab_size {
-                    d_weights[f * vocab_size + v] = current_embedding[f] * d_logits[v];
+                    d_weights[f * vocab_size + v] = transformer.combined_state[f] * d_logits[v];
                 }
             }
 
-            // 4. Backward Pass (Update Master FP32 weights)
+            // 4. Real Backward Pass
+            // Update Ternary Master Weights (STE)
             transformer.ffn.backward_ste_update(&d_weights, learning_rate);
+
+            // Backpropagate error back to the embeddings:
+            // d_embedding (K) = W^T (K x N) * d_logits (N)
+            let mut d_embedding = vec![0.0; hidden_dim];
+            for f in 0..hidden_dim {
+                let mut sum_err = 0.0;
+                for v in 0..vocab_size {
+                    // Uses FP32 master weights for precise gradient backprop
+                    sum_err += transformer.ffn.master_weights[f * vocab_size + v] * d_logits[v];
+                }
+                d_embedding[f] = sum_err;
+            }
+
+            // Update Real Embedding Layer
+            embedding_layer.backward_update(current_token, &d_embedding, learning_rate);
         }
 
         // 5. Semantic Consolidation (EverMemOS)
-        // Simulate extracting the episode and storing it in Long-Term Memory
-        let episode_embedding = &embedding_matrix[tokens[chunk_start] * hidden_dim .. tokens[chunk_start] * hidden_dim + hidden_dim];
+        // Extracts the full episode state and stores it in Long-Term Memory clusters
+        let mut episode_embedding = vec![0.0; hidden_dim];
+        embedding_layer.forward(tokens[chunk_start], &mut episode_embedding);
+
         memory_manager.ingest_episode(
             format!("Interaction Chunk {}", chunk_start),
-            episode_embedding.to_vec(),
+            episode_embedding,
             chunk_start as u64
         );
 

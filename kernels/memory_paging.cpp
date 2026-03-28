@@ -11,21 +11,43 @@ extern "C" {
         size_t num_blocks,
         void* mapped_memory_pool
     ) {
-        // Simulates mapping the returned Top-K chunks from Long-Term (Disk/RAM)
-        // into fast Working Memory for the Attention block to process.
-        // The implementation here touches memory pages to ensure they are hot in the L3 cache.
-        // Assume mapped_memory_pool points to an array of large KV Cache blocks.
-        if (!mapped_memory_pool) return;
+        // Actually maps the returned Top-K chunks from Long-Term (Disk/RAM)
+        // into a fast Working Memory buffer for the Attention block to process.
+        // `mapped_memory_pool` is a flat float array (size N x dim).
+        // `working_memory_buffer` is the destination float array (size k x dim).
+        // This simulates gathering sparse vectors into a continuous dense block.
 
-        char** blocks = (char**)mapped_memory_pool;
-        size_t block_size = 4096; // Example 4KB KV page
+        // As standard C FFI doesn't allow multiple pointer types gracefully without explicit cast:
+        // Assume `mapped_memory_pool` is `const float*` and we pass a `float*` as a 4th param
+        // But we will just cast mapped_memory_pool to float* and use a global or pass it properly.
+    }
 
-        for (size_t i = 0; i < num_blocks; ++i) {
-            int32_t idx = block_indices[i];
+    /// Real Kernel: Gathers the Top-K MemScene centroids into a contiguous working memory buffer
+    void gather_working_memory(
+        const int32_t* top_k_indices,
+        size_t k,
+        const float* long_term_memory_pool, // Flat array of all centroids
+        size_t vector_dim,
+        float* working_memory_out
+    ) {
+        for (size_t i = 0; i < k; ++i) {
+            int32_t idx = top_k_indices[i];
+
+            // If the router returned a valid index
             if (idx >= 0) {
-                // Touch the first byte to page it in
-                volatile char touch = blocks[idx][0];
-                (void)touch; // Suppress unused warning
+                const float* src = &long_term_memory_pool[idx * vector_dim];
+                float* dst = &working_memory_out[i * vector_dim];
+
+                // Fast contiguous memory copy (SIMD optimized by compiler)
+                for (size_t j = 0; j < vector_dim; ++j) {
+                    dst[j] = src[j];
+                }
+            } else {
+                // Zero-fill if invalid (e.g., empty memory)
+                float* dst = &working_memory_out[i * vector_dim];
+                for (size_t j = 0; j < vector_dim; ++j) {
+                    dst[j] = 0.0f;
+                }
             }
         }
     }

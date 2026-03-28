@@ -1,6 +1,7 @@
 pub mod data;
 pub mod ste;
 pub mod continuous;
+pub mod embedding;
 
 use std::time::Instant;
 use rand::Rng; // Depending on rand version, Rng trait might provide gen_range
@@ -221,8 +222,8 @@ pub fn run_toy_training() {
 
         let mut outputs_f32 = vec![0.0; m * n];
 
-        // Forward Pass (Quantizes FP32 Master -> 1.58-bit, then multiplies natively)
-        model.forward_naive(&real_acts, &mut outputs_f32);
+        // Forward Pass (Quantizes FP32 Master -> 1.58-bit, then multiplies using AVX2 SIMD)
+        model.forward_avx2(&real_acts, &mut outputs_f32);
 
         // Dummy Loss calculation (Mean Squared Error against synthetic target)
         // Here we do a proper dummy backprop to update the weights.
