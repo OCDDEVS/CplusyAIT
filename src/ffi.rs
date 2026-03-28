@@ -11,6 +11,17 @@ extern "C" {
         k: size_t,
     );
 
+    /// AVX2 highly-optimized Ternary GEMM Kernel.
+    /// Operates on 2-bit packed weights (uint8_t arrays).
+    pub fn ternary_gemm_avx2_packed(
+        packed_weights: *const u8,
+        activations: *const int8_t,
+        output: *mut int32_t,
+        m: size_t,
+        n: size_t,
+        k: size_t,
+    );
+
     /// C FFI Binding for the 1.58-bit Ternary Matrix Multiply Kernel
     /// This operates on {-1,0,1} weights and quantized activations.
     pub fn ternary_gemm(

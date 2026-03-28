@@ -96,23 +96,78 @@ pub fn run_benchmark() {
     let ternary_ms_per_run = ternary_duration.as_millis() as f64 / num_runs as f64;
 
     // ---------------------------------------------------------
+    // 3. Ternary 1.58-bit Setup (AVX2 SIMD with 2-bit packing)
+    // ---------------------------------------------------------
+    // To pack: 4 weights per uint8_t byte. Length is (m * k) / 4.
+    let packed_weights_len = (m * k) / 4;
+    let mut packed_ternary_weights: Vec<u8> = vec![0; packed_weights_len];
+
+    for i in 0..(m * k) {
+        let weight = ternary_weights[i]; // -1, 0, or 1
+
+        // Encode: 0 -> 00, 1 -> 01, -1 -> 10
+        let encoded: u8 = match weight {
+            1 => 1,
+            -1 => 2,
+            _ => 0,
+        };
+
+        let byte_idx = i / 4;
+        let bit_offset = (i % 4) * 2;
+
+        packed_ternary_weights[byte_idx] |= encoded << bit_offset;
+    }
+
+    let mut avx2_output: Vec<i32> = vec![0; m * n];
+
+    // Warmup
+    unsafe {
+        ffi::ternary_gemm_avx2_packed(
+            packed_ternary_weights.as_ptr(),
+            int8_acts.as_ptr(),
+            avx2_output.as_mut_ptr(),
+            m, n, k
+        );
+    }
+
+    let start = Instant::now();
+    for _ in 0..num_runs {
+        unsafe {
+            ffi::ternary_gemm_avx2_packed(
+                packed_ternary_weights.as_ptr(),
+                int8_acts.as_ptr(),
+                avx2_output.as_mut_ptr(),
+                m, n, k
+            );
+        }
+    }
+    let avx2_duration = start.elapsed();
+    let avx2_ms_per_run = avx2_duration.as_millis() as f64 / num_runs as f64;
+
+
+    // ---------------------------------------------------------
     // Results & Memory
     // ---------------------------------------------------------
     let fp32_mem_kb = (fp32_weights.len() * 4) / 1024;
-    let ternary_mem_kb = ternary_weights.len() / 1024; // 1 byte per weight currently (could be 2-bit packed)
+    let ternary_mem_kb = ternary_weights.len() / 1024; // 1 byte per weight currently (unpacked)
+    let packed_mem_kb = packed_ternary_weights.len() / 1024; // Actual 2-bit packed size
 
     println!("\n--- Benchmark Results (Averaged over {} runs) ---", num_runs);
     println!("[FP32 Baseline]");
     println!("Time: {:.2} ms/pass", fp32_ms_per_run);
     println!("Weights Memory: {} KB", fp32_mem_kb);
 
-    println!("\n[1.58-bit Ternary]");
+    println!("\n[1.58-bit Ternary (Scalar Unpacked)]");
     println!("Time: {:.2} ms/pass", ternary_ms_per_run);
-    println!("Weights Memory: {} KB (Unpacked Int8)", ternary_mem_kb);
+    println!("Weights Memory: {} KB", ternary_mem_kb);
 
-    let speedup = fp32_ms_per_run / ternary_ms_per_run;
-    println!("\n=> Ternary Speedup: {:.2}x", speedup);
-    println!("=> Memory Reduction: {:.2}x (Without 2-bit packing)", (fp32_mem_kb as f64) / (ternary_mem_kb as f64));
+    println!("\n[1.58-bit Ternary (AVX2 SIMD 2-bit Packed)]");
+    println!("Time: {:.2} ms/pass", avx2_ms_per_run);
+    println!("Weights Memory: {} KB", packed_mem_kb);
+
+    let avx2_speedup = fp32_ms_per_run / avx2_ms_per_run;
+    println!("\n=> Final AVX2 Ternary Speedup: {:.2}x", avx2_speedup);
+    println!("=> Final Memory Reduction: {:.2}x", (fp32_mem_kb as f64) / (packed_mem_kb as f64));
     println!("-----------------------------------");
 }
 
