@@ -77,7 +77,10 @@ impl MultiHeadAttention {
         // Calculate frequencies for RoPE
         for b in 0..b_sz {
             for s in 0..seq_len {
-                let pos = positions[s] as f32;
+                // Safely grab the position, defaulting to the sequence index if the
+                // positions array provided isn't long enough.
+                let pos = if s < positions.len() { positions[s] as f32 } else { s as f32 };
+
                 for h in 0..num_heads {
                     for d in (0..head_dim).step_by(2) {
                         let inv_freq = 1.0 / 10000_f32.powf(d as f32 / head_dim as f32);
@@ -88,11 +91,13 @@ impl MultiHeadAttention {
                                   s * (num_heads * head_dim) +
                                   h * head_dim + d;
 
-                        let x0 = x_vec[idx];
-                        let x1 = x_vec[idx + 1];
+                        if idx + 1 < x_vec.len() {
+                            let x0 = x_vec[idx];
+                            let x1 = x_vec[idx + 1];
 
-                        rotated_elements[idx] = x0 * cos - x1 * sin;
-                        rotated_elements[idx + 1] = x1 * cos + x0 * sin;
+                            rotated_elements[idx] = x0 * cos - x1 * sin;
+                            rotated_elements[idx + 1] = x1 * cos + x0 * sin;
+                        }
                     }
                 }
             }

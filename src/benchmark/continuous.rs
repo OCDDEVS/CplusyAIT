@@ -134,7 +134,8 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
     let mut steps = 0;
 
     // Continuously read the user interaction stream and train using proper Cross-Entropy and Backprop
-    for chunk_start in (0..1000).step_by(context_window) { // Train on first 1000 tokens
+    let max_tokens = std::cmp::min(1000, tokens.len().saturating_sub(1));
+    for chunk_start in (0..max_tokens).step_by(context_window) {
 
         for i in 0..context_window {
             let idx = chunk_start + i;
@@ -208,7 +209,8 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
         // 5. Semantic Consolidation (EverMemOS)
         // Extracts the full episode state and stores it in Long-Term Memory clusters
         let mut episode_embedding = vec![0.0; hidden_dim];
-        embedding_layer.forward(tokens[chunk_start], &mut episode_embedding);
+        let safe_idx = std::cmp::min(chunk_start, tokens.len().saturating_sub(1));
+        embedding_layer.forward(tokens[safe_idx], &mut episode_embedding);
 
         memory_manager.ingest_episode(
             format!("Interaction Chunk {}", chunk_start),
