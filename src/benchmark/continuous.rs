@@ -60,6 +60,20 @@ impl TransformerBlock {
 
         // 2. MSA Retrieval: Route query to Top-K MemScenes
         if !memory_manager.routing_keys_vram.is_empty() {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                ffi::flash_msa_route_kernel(
+                    mha_vec.as_ptr(),
+                    memory_manager.routing_keys_vram.as_ptr(),
+                    top_k_indices.as_mut_ptr(),
+                    1, // num queries
+                    memory_manager.scenes.len() as i32,
+                    memory_manager.vector_dim as i32,
+                    top_k as i32
+                );
+            }
+
+            #[cfg(not(feature = "cuda"))]
             unsafe {
                 ffi::msa_route_top_k(
                     mha_vec.as_ptr(),
@@ -69,8 +83,10 @@ impl TransformerBlock {
                     memory_manager.vector_dim,
                     top_k
                 );
+            }
 
-                // 2. Memory Paging: Gather the actual clustered MemScene centroids
+            // 2. Memory Paging: Gather the actual clustered MemScene centroids
+            unsafe {
                 ffi::gather_working_memory(
                     top_k_indices.as_ptr(),
                     top_k,
@@ -118,7 +134,8 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
     let mut steps = 0;
 
     // Continuously read the user interaction stream and train using proper Cross-Entropy and Backprop
-    for chunk_start in (0..1000).step_by(context_window) { // Train on first 1000 tokens
+    let max_tokens = std::cmp::min(1000, tokens.len().saturating_sub(1));
+    for chunk_start in (0..max_tokens).step_by(context_window) {
 
         for i in 0..context_window {
             let idx = chunk_start + i;
@@ -192,7 +209,8 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
         // 5. Semantic Consolidation (EverMemOS)
         // Extracts the full episode state and stores it in Long-Term Memory clusters
         let mut episode_embedding = vec![0.0; hidden_dim];
-        embedding_layer.forward(tokens[chunk_start], &mut episode_embedding);
+        let safe_idx = std::cmp::min(chunk_start, tokens.len().saturating_sub(1));
+        embedding_layer.forward(tokens[safe_idx], &mut episode_embedding);
 
         memory_manager.ingest_episode(
             format!("Interaction Chunk {}", chunk_start),

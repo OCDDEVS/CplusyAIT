@@ -1,6 +1,5 @@
 #include <cstdint>
 #include <cstddef>
-#include <immintrin.h> // For future SIMD support
 
 extern "C" {
 
