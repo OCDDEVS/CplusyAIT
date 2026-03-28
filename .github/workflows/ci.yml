@@ -46,4 +46,4 @@ jobs:
       shell: bash
 
     - name: Run Benchmarks (CPU Only)
-      run: cargo run --release -- --benchmark
+      run: cargo run --release --bin cpu_ai_framework -- --benchmark

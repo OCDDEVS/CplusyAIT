@@ -179,8 +179,9 @@ pub fn run_continuous_learning(tokens: &[usize], vocab_size: usize) {
                 let mamba_output_cpu = mamba_output.to_device(&Device::Cpu).unwrap();
                 let out_vec = mamba_output_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
-                // Send computed Token T state to CPU pipeline
-                tx_thread.send(out_vec).unwrap();
+                // Send computed Token T state to CPU pipeline.
+                // Ignore send errors in case the main thread finished early.
+                let _ = tx_thread.send(out_vec);
             });
 
             // True Pipeline Parallelism: While the GPU works on Token T (Thread spawned above),
