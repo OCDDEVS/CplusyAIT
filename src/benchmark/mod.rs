@@ -205,19 +205,23 @@ pub fn run_toy_training() {
     let epochs = 5;
     let learning_rate = 0.01;
 
-    let mut acts = vec![0; k * m];
-    let mut outputs = vec![0; m * n];
     let mut fake_gradients = vec![0.0; n * k];
 
     for epoch in 1..=epochs {
-        // Create synthetic input activations (e.g., character embeddings)
-        let mut rng = rand::thread_rng();
-        for val in &mut acts {
-            *val = rng.gen_range(-10..10);
+        // Let's grab real tokens from TinyShakespeare
+        let mut real_acts = vec![0.0; m * k];
+
+        // One-hot encode the tokens
+        let start_idx = (epoch * m) % tokens.len();
+        for i in 0..m {
+            let token = tokens[(start_idx + i) % tokens.len()];
+            real_acts[i * k + token] = 1.0;
         }
 
-        // Forward Pass (Quantizes FP32 Master -> 1.58-bit, then multiplies)
-        model.forward(&acts, &mut outputs);
+        let mut outputs_f32 = vec![0.0; m * n];
+
+        // Forward Pass (Quantizes FP32 Master -> 1.58-bit, then multiplies natively)
+        model.forward_naive(&real_acts, &mut outputs_f32);
 
         // Dummy Loss calculation (Mean Squared Error against synthetic target)
         // Here we do a proper dummy backprop to update the weights.
@@ -228,11 +232,13 @@ pub fn run_toy_training() {
         let mut sum_output = 0.0;
         let mut d_out = vec![0.0; m * n];
 
-        for (i, &out) in outputs.iter().enumerate() {
-            let target = 0; // Target is simply 0 to check if model can learn to output 0s
-            let diff = (out as f32) - (target as f32);
+        for (i, &out) in outputs_f32.iter().enumerate() {
+            // Target is a synthetic feature target representing next character distribution prediction.
+            // For this toy loop, we just use a target vector of size N (e.g., all 0.5s).
+            let target = 0.5;
+            let diff = out - target;
             loss += diff * diff;
-            sum_output += out as f32;
+            sum_output += out;
 
             // Gradient of MSE loss: 2 * diff / (m*n)
             d_out[i] = 2.0 * diff / (m * n) as f32;
@@ -244,8 +250,8 @@ pub fn run_toy_training() {
             for j in 0..n {
                 let mut acc = 0.0;
                 for l in 0..m {
-                    // acts[l][i] * d_out[l][j]
-                    acc += (acts[l * k + i] as f32) * d_out[l * n + j];
+                    // real_acts[l][i] * d_out[l][j]
+                    acc += real_acts[l * k + i] * d_out[l * n + j];
                 }
                 fake_gradients[i * n + j] = acc;
             }

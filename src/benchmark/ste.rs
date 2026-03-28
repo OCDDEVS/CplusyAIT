@@ -45,25 +45,32 @@ impl TernarySTEModel {
         }
     }
 
-    /// Forward pass using the fast C++ Ternary Kernel
-    pub fn forward(&mut self, activations_int8: &[i8], output_int32: &mut [i32]) {
+    /// Forward pass using the standard FP32 Kernel for the toy training loop
+    /// Note: Since our fast Ternary C++ kernel is strictly written as (Weights * Activations)
+    /// where Weights MUST be {-1, 0, 1}, we cannot swap the arguments (A * B) if A is activations
+    /// containing arbitrary integers.
+    /// For this toy STE training loop, we will use a naive Rust implementation of the forward pass
+    /// to correctly apply the quantized ternary weights to the activations.
+    pub fn forward_naive(&mut self, activations: &[f32], output: &mut [f32]) {
         self.quantize(); // Ensure quantized weights match current master weights before forward pass
 
-        // In our C++ kernel definition: output(m x n) = weights(m x k) * activations(k x n)
-        // Here, activations are the input data (batch x feature) which is M x K.
-        // The model weights are feature x hidden (K x N).
-        // To match the C++ signature, we actually need to compute A * B.
-        // If activations = A (M x K) and weights = B (K x N), we must pass them as:
-        // ternary_gemm(A, B, out, m, n, k).
-        // So `weights` parameter in C++ receives `activations`, and `activations` parameter receives `weights`.
+        // Output (M x N) = Activations (M x K) * Weights (K x N)
+        for row in 0..self.m {
+            for col in 0..self.n {
+                let mut acc = 0.0;
+                for i in 0..self.k {
+                    let act = activations[row * self.k + i];
+                    let weight = self.quantized_weights[i * self.n + col];
 
-        unsafe {
-            ffi::ternary_gemm(
-                activations_int8.as_ptr(),      // A (m x k)
-                self.quantized_weights.as_ptr(),// B (k x n)
-                output_int32.as_mut_ptr(),      // Output (m x n)
-                self.m, self.n, self.k
-            );
+                    // Ternary math (using the quantized -1, 0, 1 weights)
+                    if weight == 1 {
+                        acc += act;
+                    } else if weight == -1 {
+                        acc -= act;
+                    }
+                }
+                output[row * self.n + col] = acc;
+            }
         }
     }
 
