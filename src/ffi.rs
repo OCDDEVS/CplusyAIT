@@ -1,10 +1,20 @@
 use libc::{int32_t, int8_t, size_t, c_float, c_void};
 
 extern "C" {
+    /// Full Precision (FP32) General Matrix Multiply (GEMM)
+    pub fn fp32_gemm(
+        weights: *const c_float,
+        activations: *const c_float,
+        output: *mut c_float,
+        m: size_t,
+        n: size_t,
+        k: size_t,
+    );
+
     /// C FFI Binding for the 1.58-bit Ternary Matrix Multiply Kernel
-    /// This operates on packed weights and quantized activations.
+    /// This operates on {-1,0,1} weights and quantized activations.
     pub fn ternary_gemm(
-        packed_weights: *const int8_t,
+        weights: *const int8_t,
         activations: *const int8_t,
         output: *mut int32_t,
         m: size_t,

@@ -1,6 +1,7 @@
 pub mod ffi;
 pub mod core;
 pub mod memory;
+pub mod benchmark;
 
 fn main() {
     println!("Next-Gen CPU AI Framework Initialized.");
@@ -12,4 +13,10 @@ fn main() {
 
     // Example run loop
     println!("Ready to achieve 100 Tokens/s on an 8GB RAM CPU boundary!");
+
+    // Run the benchmarking suite to compare FP32 vs Ternary
+    benchmark::run_benchmark();
+
+    // Run the Toy Training Loop to prove 1.58-bit STE Learning
+    benchmark::run_toy_training();
 }
