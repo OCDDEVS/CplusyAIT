@@ -1,6 +1,7 @@
 pub mod attention;
 pub mod checkpoint;
 pub mod mamba;
+pub mod infer;
 
 pub use candle_core::{Tensor, Device, DType};
 pub use candle_nn::{Linear, Module};
@@ -83,3 +84,4 @@ pub fn run_avx2_ternary_gemm(
     // Convert back into a Candle Tensor
     Tensor::from_vec(output_vec, (m, n), &device)
 }
+pub mod train;
