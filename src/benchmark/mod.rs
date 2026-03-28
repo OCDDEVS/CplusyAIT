@@ -1,5 +1,6 @@
 pub mod data;
 pub mod ste;
+pub mod continuous;
 
 use std::time::Instant;
 use rand::Rng; // Depending on rand version, Rng trait might provide gen_range
@@ -267,4 +268,9 @@ pub fn run_toy_training() {
     println!("-----------------------------------");
     println!("As shown, the loss drops successfully across epochs.");
     println!("This proves that standard backprop gradients flow *through* the ternary forward pass and correctly update the high-precision master weights (STE), allowing the 1.58-bit model to learn.");
+
+    // ---------------------------------------------------------
+    // Run the Continuous Learning Loop (MSA + EverMemOS)
+    // ---------------------------------------------------------
+    continuous::run_continuous_learning(&tokens, vocab_size);
 }

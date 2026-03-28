@@ -11,9 +11,23 @@ extern "C" {
         size_t num_blocks,
         void* mapped_memory_pool
     ) {
-        // Pseudo-implementation: Direct memory manipulation for paging large
-        // KV caches from disk into the fast CPU cache.
-        // E.g., loading specific blocks identified by `msa_route_top_k`.
+        // Simulates mapping the returned Top-K chunks from Long-Term (Disk/RAM)
+        // into fast Working Memory for the Attention block to process.
+        // The implementation here touches memory pages to ensure they are hot in the L3 cache.
+        // Assume mapped_memory_pool points to an array of large KV Cache blocks.
+        if (!mapped_memory_pool) return;
+
+        char** blocks = (char**)mapped_memory_pool;
+        size_t block_size = 4096; // Example 4KB KV page
+
+        for (size_t i = 0; i < num_blocks; ++i) {
+            int32_t idx = block_indices[i];
+            if (idx >= 0) {
+                // Touch the first byte to page it in
+                volatile char touch = blocks[idx][0];
+                (void)touch; // Suppress unused warning
+            }
+        }
     }
 
 }
