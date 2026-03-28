@@ -29,6 +29,17 @@ By packing the memory into 2 bits, a 7B parameter model (typically ~14GB in FP16
 
 Detailed analysis can be found in `BENCHMARKS.md`.
 
+## Noob-Friendly Automated PTQ Converter
+If you just want to run standard AI models (like Llama 3) incredibly fast without writing code or manually training them, we have included an automated **Post-Training Quantization (PTQ)** conversion tool.
+
+1. Download a model (in `.safetensors` format) from Hugging Face and place it in the `models/` directory.
+2. Run the one-click conversion script for your platform:
+   - **Linux/macOS:** `./convert.sh`
+   - **Windows:** `convert.bat`
+3. The script will interactively load your massive FP16 model, mathematically crush the weights into our 2-bit packed `uint8_t` memory layout, and save a blazing-fast, tiny 1.58-bit version to your disk.
+
+For a full guide on how to fine-tune models to regain intelligence, see `HOWTO.md`.
+
 ## Toy Training Loop: Straight-Through Estimator (STE)
 
 To prove that 1.58-bit ternary models can learn locally, this framework includes a toy Multi-Layer Perceptron (MLP) training loop using the TinyShakespeare dataset.
