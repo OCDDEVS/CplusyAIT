@@ -60,6 +60,20 @@ impl TransformerBlock {
 
         // 2. MSA Retrieval: Route query to Top-K MemScenes
         if !memory_manager.routing_keys_vram.is_empty() {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                ffi::flash_msa_route_kernel(
+                    mha_vec.as_ptr(),
+                    memory_manager.routing_keys_vram.as_ptr(),
+                    top_k_indices.as_mut_ptr(),
+                    1, // num queries
+                    memory_manager.scenes.len() as i32,
+                    memory_manager.vector_dim as i32,
+                    top_k as i32
+                );
+            }
+
+            #[cfg(not(feature = "cuda"))]
             unsafe {
                 ffi::msa_route_top_k(
                     mha_vec.as_ptr(),
@@ -69,8 +83,10 @@ impl TransformerBlock {
                     memory_manager.vector_dim,
                     top_k
                 );
+            }
 
-                // 2. Memory Paging: Gather the actual clustered MemScene centroids
+            // 2. Memory Paging: Gather the actual clustered MemScene centroids
+            unsafe {
                 ffi::gather_working_memory(
                     top_k_indices.as_ptr(),
                     top_k,

@@ -1,5 +1,6 @@
 pub mod attention;
 pub mod checkpoint;
+pub mod mamba;
 
 pub use candle_core::{Tensor, Device, DType};
 pub use candle_nn::{Linear, Module};

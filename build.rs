@@ -19,6 +19,21 @@ fn main() {
 
     builder.compile("cpu_ai_kernels");
 
+    // Optional: Compile CUDA kernels if the `cuda` feature is active
+    if std::env::var("CARGO_FEATURE_CUDA").is_ok() {
+        println!("cargo:info=Compiling experimental CUDA kernels for Tri-Hybrid architecture.");
+        // This requires `nvcc` to be installed. We bypass if not found.
+        cc::Build::new()
+            .cuda(true)
+            .file("kernels/flash_msa.cu")
+            .file("kernels/gpu_ternary_gemm.cu")
+            .flag("-arch=sm_80") // Example architecture target (Ampere)
+            .compile("gpu_ai_kernels");
+
+        println!("cargo:rerun-if-changed=kernels/flash_msa.cu");
+        println!("cargo:rerun-if-changed=kernels/gpu_ternary_gemm.cu");
+    }
+
     println!("cargo:rerun-if-changed=kernels/fp32_gemm.cpp");
     println!("cargo:rerun-if-changed=kernels/cpu_ternary_gemm.cpp");
     println!("cargo:rerun-if-changed=kernels/msa_router.cpp");

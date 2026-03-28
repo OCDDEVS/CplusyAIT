@@ -59,4 +59,25 @@ extern "C" {
         vector_dim: size_t,
         working_memory_out: *mut c_float,
     );
+
+    /// (CUDA) GPU-Native Flash-MSA Routing Kernel (in Shared Memory)
+    pub fn flash_msa_route_kernel(
+        query_vectors: *const c_float,
+        routing_keys: *const c_float,
+        top_k_indices_out: *mut int32_t,
+        num_queries: int32_t,
+        num_keys: int32_t,
+        vector_dim: int32_t,
+        k: int32_t,
+    );
+
+    /// (CUDA) 1.58-bit Ternary GPU Kernels (__dp4a)
+    pub fn ternary_gemm_dp4a_kernel(
+        packed_weights: *const u8,
+        activations: *const int8_t,
+        output: *mut int32_t,
+        m: int32_t,
+        n: int32_t,
+        k: int32_t,
+    );
 }

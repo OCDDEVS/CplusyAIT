@@ -118,24 +118,38 @@ impl TernarySTEModel {
 
         let mut output_int32 = vec![0i32; self.n * self.m]; // N x M
 
-        #[cfg(target_arch = "x86_64")]
-        if std::is_x86_feature_detected!("avx2") {
-            unsafe {
-                // Weights (N x K) * Activations (K x M) = Output (N x M)
-                // m=N, k=K, n=M.
-                ffi::ternary_gemm_avx2_packed(
-                    self.packed_quantized_weights.as_ptr(),
-                    activations_int8.as_ptr(),
-                    output_int32.as_mut_ptr(),
-                    self.n, self.m, self.k
-                );
+        #[cfg(feature = "cuda")]
+        unsafe {
+            ffi::ternary_gemm_dp4a_kernel(
+                self.packed_quantized_weights.as_ptr(),
+                activations_int8.as_ptr(),
+                output_int32.as_mut_ptr(),
+                self.n as i32, self.m as i32, self.k as i32
+            );
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx2") {
+                unsafe {
+                    // Weights (N x K) * Activations (K x M) = Output (N x M)
+                    // m=N, k=K, n=M.
+                    ffi::ternary_gemm_avx2_packed(
+                        self.packed_quantized_weights.as_ptr(),
+                        activations_int8.as_ptr(),
+                        output_int32.as_mut_ptr(),
+                        self.n, self.m, self.k
+                    );
+                }
+            } else {
+                self.scalar_fallback(&activations_int8, &mut output_int32);
             }
-        } else {
+
+            #[cfg(not(target_arch = "x86_64"))]
             self.scalar_fallback(&activations_int8, &mut output_int32);
         }
 
-        #[cfg(not(target_arch = "x86_64"))]
-        self.scalar_fallback(&activations_int8, &mut output_int32);
 
         // 3. Dequantize Int32 back to FP32.
         // Out_f32 = Out_i32 * gamma * act_scale
