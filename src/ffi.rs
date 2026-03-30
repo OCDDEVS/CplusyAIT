@@ -45,10 +45,13 @@ extern "C" {
     );
 
     /// C FFI Binding for KV Cache Disk Paging.
+    /// Pages KV blocks from an mmap'd region into a working buffer.
     pub fn page_kv_cache(
         block_indices: *mut int32_t,
         num_blocks: size_t,
         mapped_memory_pool: *mut c_void,
+        block_size_bytes: size_t,
+        output_buffer: *mut c_void,
     );
 
     /// Gathers Top-K MemScene centroids into a continuous working memory buffer

@@ -100,8 +100,12 @@ impl MemoryManager {
     }
 
     pub fn enable_disk_paging(&mut self, path: &str, max_blocks: usize) -> std::io::Result<()> {
-        let block_size = self.vector_dim * std::mem::size_of::<f32>();
-        let pager = paging::DiskMemoryPager::new(path, max_blocks, block_size)?;
+        let pager = paging::DiskMemoryPager::new(
+            path,
+            max_blocks,
+            1, // single "head" for memory vectors
+            self.vector_dim,
+        )?;
         self.pager = Some(pager);
         Ok(())
     }

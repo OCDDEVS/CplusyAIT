@@ -122,11 +122,16 @@ impl LayerKVCache {
 }
 
 /// Full KV cache across all layers with memory budget enforcement.
+/// When a `DiskMemoryPager` is attached, evicted positions are paged to
+/// NVMe SSD instead of being dropped, enabling retrieval via MSA routing.
 pub struct KVCache {
     pub layers: Vec<LayerKVCache>,
     /// Maximum memory budget in bytes for the entire KV cache.
     /// 0 means unlimited.
     pub max_memory_bytes: usize,
+    /// Optional disk pager for overflow. When present, evicted KV blocks
+    /// are written to an mmap'd file on SSD instead of being lost.
+    pub pager: Option<crate::memory::paging::DiskMemoryPager>,
 }
 
 impl KVCache {
@@ -134,7 +139,7 @@ impl KVCache {
         let layers = (0..num_layers)
             .map(|_| LayerKVCache::new(num_kv_heads, head_dim))
             .collect();
-        Self { layers, max_memory_bytes: 0 }
+        Self { layers, max_memory_bytes: 0, pager: None }
     }
 
     /// Create a KV cache with a memory budget (in bytes).
@@ -142,7 +147,25 @@ impl KVCache {
         let layers = (0..num_layers)
             .map(|_| LayerKVCache::new(num_kv_heads, head_dim))
             .collect();
-        Self { layers, max_memory_bytes: budget_bytes }
+        Self { layers, max_memory_bytes: budget_bytes, pager: None }
+    }
+
+    /// Attach a disk pager for NVMe-backed KV cache overflow.
+    /// Evicted positions will be written to disk instead of dropped.
+    pub fn enable_disk_paging(
+        &mut self,
+        path: &str,
+        max_paged_blocks: usize,
+    ) -> std::io::Result<()> {
+        let first = &self.layers[0];
+        let pager = crate::memory::paging::DiskMemoryPager::new(
+            path,
+            max_paged_blocks,
+            first.num_kv_heads,
+            first.head_dim,
+        )?;
+        self.pager = Some(pager);
+        Ok(())
     }
 
     pub fn seq_len(&self) -> usize {
@@ -155,6 +178,8 @@ impl KVCache {
     }
 
     /// Enforce the memory budget by evicting oldest positions if needed.
+    /// When a disk pager is attached, evicted KV blocks are written to SSD.
+    /// Without a pager, evicted positions are dropped (sliding window).
     /// Returns the number of positions evicted.
     pub fn enforce_budget(&mut self) -> usize {
         if self.max_memory_bytes == 0 {
@@ -166,15 +191,30 @@ impl KVCache {
             return 0;
         }
 
-        // Calculate how many positions to evict
-        // Each position across all layers uses:
-        // num_layers * 2 (K+V) * num_kv_heads * head_dim * sizeof(f32)
         let first = &self.layers[0];
         let bytes_per_position = self.layers.len() * 2 * first.num_kv_heads * first.head_dim * 4;
         if bytes_per_position == 0 { return 0; }
 
         let excess = current - self.max_memory_bytes;
         let positions_to_evict = (excess + bytes_per_position - 1) / bytes_per_position;
+
+        // Page out to disk if pager is available
+        if let Some(ref mut pager) = self.pager {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let stride = layer.num_kv_heads * layer.head_dim;
+                let evict_floats = positions_to_evict * stride;
+
+                if evict_floats <= layer.keys.len() {
+                    let evicted_keys = &layer.keys[..evict_floats];
+                    let evicted_values = &layer.values[..evict_floats];
+
+                    // The evicted positions start at the beginning of the cache
+                    // (oldest positions). We track the original position as
+                    // seq_len - current_len (approximate, since we evict uniformly).
+                    pager.page_out(evicted_keys, evicted_values, 0, layer_idx);
+                }
+            }
+        }
 
         // Evict from all layers uniformly
         for layer in &mut self.layers {
@@ -188,5 +228,25 @@ impl KVCache {
         for layer in &mut self.layers {
             layer.clear();
         }
+        if let Some(ref mut pager) = self.pager {
+            pager.clear();
+        }
+    }
+
+    /// Page in KV blocks from disk for a specific layer.
+    /// Returns (keys, values) for the requested slots.
+    /// Used when MSA routing selects positions that have been evicted to disk.
+    pub fn page_in_layer(&self, layer_idx: usize, slot_indices: &[usize]) -> Option<(Vec<f32>, Vec<f32>)> {
+        self.pager.as_ref().map(|p| p.page_in(slot_indices))
+    }
+
+    /// Get the number of paged-out blocks on disk.
+    pub fn paged_block_count(&self) -> usize {
+        self.pager.as_ref().map_or(0, |p| p.paged_block_count())
+    }
+
+    /// Get disk usage in bytes.
+    pub fn disk_usage_bytes(&self) -> usize {
+        self.pager.as_ref().map_or(0, |p| p.disk_usage_bytes())
     }
 }

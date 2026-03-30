@@ -23,6 +23,7 @@ fn main() {
     let mut kv_budget_mb: usize = 0; // 0 = unlimited
     let mut mixing_mode = MixingMode::Attention;
     let mut doc_boundary_token: Option<String> = None;
+    let mut kv_paging_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -48,6 +49,10 @@ fn main() {
             "--doc-boundary" => {
                 i += 1;
                 doc_boundary_token = Some(args[i].clone());
+            }
+            "--kv-paging" => {
+                i += 1;
+                kv_paging_path = Some(args[i].clone());
             }
             "--help" | "-h" => {
                 print_usage();
@@ -97,6 +102,16 @@ fn main() {
     if kv_budget_mb > 0 {
         model.kv_cache.max_memory_bytes = kv_budget_mb * 1024 * 1024;
         println!("KV cache budget: {} MB", kv_budget_mb);
+    }
+
+    // Enable disk paging for KV cache overflow
+    if let Some(ref paging_path) = kv_paging_path {
+        // Default: page up to 1M positions to disk
+        let max_paged = 1_000_000;
+        match model.kv_cache.enable_disk_paging(paging_path, max_paged) {
+            Ok(()) => println!("KV disk paging enabled: {} (up to {} positions)", paging_path, max_paged),
+            Err(e) => eprintln!("Warning: Failed to enable disk paging: {}", e),
+        }
     }
 
     // Load tokenizer — look for tokenizer.json in the model directory
@@ -183,10 +198,15 @@ fn main() {
     println!("Prefill:   {:.1} ms ({} tokens)", result.prefill_time_ms, prompt_tokens.len());
     println!("Generated: {} tokens in {:.1} ms", result.token_ids.len(), result.total_time_ms);
     println!("Speed:     {:.1} tokens/sec", result.tokens_per_second);
+    if model.kv_cache.paged_block_count() > 0 {
+        println!("KV paged:  {} blocks ({:.1} MB on disk)",
+            model.kv_cache.paged_block_count(),
+            model.kv_cache.disk_usage_bytes() as f64 / (1024.0 * 1024.0));
+    }
 }
 
 fn print_usage() {
-    println!("Usage: infer --model <path> [--prompt <text>] [--max-tokens <n>] [--temperature <f>] [--top-k <n>] [--kv-budget <MB>] [--mixing-mode <mode>] [--doc-boundary <token>]");
+    println!("Usage: infer --model <path> [--prompt <text>] [--max-tokens <n>] [--temperature <f>] [--top-k <n>] [--kv-budget <MB>] [--kv-paging <file>] [--mixing-mode <mode>] [--doc-boundary <token>]");
     println!();
     println!("Options:");
     println!("  --model          Path to quantized model dir (manifest.json + weights.bin + tokenizer.json)");
@@ -195,6 +215,7 @@ fn print_usage() {
     println!("  --temperature    Sampling temperature (default: 0.7, use 0 for greedy)");
     println!("  --top-k          Top-K sampling (default: 40)");
     println!("  --kv-budget      KV cache memory budget in MB (default: unlimited)");
+    println!("  --kv-paging      File path for NVMe-backed KV cache overflow (mmap'd)");
     println!("  --mixing-mode    Sequence mixing: attention (default), mamba, or hybrid");
     println!("  --doc-boundary   Token or ID marking document boundaries for RoPE reset");
     println!("                   (e.g. \"<doc>\" or a numeric token ID like 2)");

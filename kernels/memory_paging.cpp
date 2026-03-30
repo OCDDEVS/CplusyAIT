@@ -1,49 +1,60 @@
 #include <cstdint>
 #include <cstddef>
-// #include <sys/mman.h> // For direct paging if needed
+#include <cstring>
 
 extern "C" {
 
-    /// Manages paging KV cache from NVMe disk to CPU RAM for the EverMemOS memory lifecycle.
-    /// Crucial for supporting millions of tokens within an 8GB RAM budget.
+    /// Page KV cache blocks from a memory-mapped region into a working buffer.
+    /// `block_indices`: array of block slot indices to fetch (length = num_blocks).
+    /// `num_blocks`: number of blocks to page in.
+    /// `mapped_memory_pool`: base pointer to the mmap'd file region.
+    /// `block_size_bytes`: size of each KV block in bytes (keys + values).
+    /// `output_buffer`: destination buffer (must be at least num_blocks * block_size_bytes).
     void page_kv_cache(
         int32_t* block_indices,
         size_t num_blocks,
-        void* mapped_memory_pool
+        void* mapped_memory_pool,
+        size_t block_size_bytes,
+        void* output_buffer
     ) {
-        // Actually maps the returned Top-K chunks from Long-Term (Disk/RAM)
-        // into a fast Working Memory buffer for the Attention block to process.
-        // `mapped_memory_pool` is a flat float array (size N x dim).
-        // `working_memory_buffer` is the destination float array (size k x dim).
-        // This simulates gathering sparse vectors into a continuous dense block.
+        const char* src_base = static_cast<const char*>(mapped_memory_pool);
+        char* dst_base = static_cast<char*>(output_buffer);
 
-        // As standard C FFI doesn't allow multiple pointer types gracefully without explicit cast:
-        // Assume `mapped_memory_pool` is `const float*` and we pass a `float*` as a 4th param
-        // But we will just cast mapped_memory_pool to float* and use a global or pass it properly.
+        for (size_t i = 0; i < num_blocks; ++i) {
+            int32_t idx = block_indices[i];
+            if (idx >= 0) {
+                const char* src = src_base + (static_cast<size_t>(idx) * block_size_bytes);
+                char* dst = dst_base + (i * block_size_bytes);
+                std::memcpy(dst, src, block_size_bytes);
+            } else {
+                // Invalid index: zero-fill the output slot
+                char* dst = dst_base + (i * block_size_bytes);
+                std::memset(dst, 0, block_size_bytes);
+            }
+        }
     }
 
-    /// Real Kernel: Gathers the Top-K MemScene centroids into a contiguous working memory buffer
+    /// Gathers Top-K MemScene centroids into a contiguous working memory buffer.
+    /// Used by the MSA router to collect selected memory vectors for attention.
     void gather_working_memory(
         const int32_t* top_k_indices,
         size_t k,
-        const float* long_term_memory_pool, // Flat array of all centroids
+        const float* long_term_memory_pool,
         size_t vector_dim,
         float* working_memory_out
     ) {
         for (size_t i = 0; i < k; ++i) {
             int32_t idx = top_k_indices[i];
 
-            // If the router returned a valid index
             if (idx >= 0) {
                 const float* src = &long_term_memory_pool[idx * vector_dim];
                 float* dst = &working_memory_out[i * vector_dim];
 
-                // Fast contiguous memory copy (SIMD optimized by compiler)
+                // Fast contiguous memory copy (SIMD optimized by compiler with -O3)
                 for (size_t j = 0; j < vector_dim; ++j) {
                     dst[j] = src[j];
                 }
             } else {
-                // Zero-fill if invalid (e.g., empty memory)
                 float* dst = &working_memory_out[i * vector_dim];
                 for (size_t j = 0; j < vector_dim; ++j) {
                     dst[j] = 0.0f;
