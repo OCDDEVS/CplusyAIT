@@ -4,6 +4,47 @@ use std::path::{Path, PathBuf};
 use dialoguer::{theme::ColorfulTheme, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use safetensors::tensor::SafeTensors;
+use serde::{Deserialize, Serialize};
+
+/// Matches the inference::format::TensorMeta structure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TensorMeta {
+    name: String,
+    shape: Vec<usize>,
+    byte_offset: usize,
+    byte_length: usize,
+    gamma: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelManifest {
+    model_type: String,
+    hidden_dim: usize,
+    num_layers: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    vocab_size: usize,
+    max_seq_len: usize,
+    intermediate_dim: usize,
+    rope_theta: f64,
+    rms_norm_eps: f64,
+    tensors: Vec<TensorMeta>,
+}
+
+/// Simple HF config.json fields we care about.
+#[derive(Debug, Deserialize)]
+struct HFConfig {
+    hidden_size: Option<usize>,
+    num_hidden_layers: Option<usize>,
+    num_attention_heads: Option<usize>,
+    num_key_value_heads: Option<usize>,
+    vocab_size: Option<usize>,
+    max_position_embeddings: Option<usize>,
+    intermediate_size: Option<usize>,
+    rope_theta: Option<f64>,
+    rms_norm_eps: Option<f64>,
+    model_type: Option<String>,
+}
 
 fn get_safetensor_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -11,47 +52,93 @@ fn get_safetensor_files(dir: &Path) -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() && path.extension().map_or(false, |e| e == "safetensors") {
-                files.push(path);
+                files.push(path.clone());
+            }
+            // Also check subdirectories (HF models are often in subdirs)
+            if path.is_dir() {
+                if let Ok(sub_entries) = fs::read_dir(&path) {
+                    for sub in sub_entries.flatten() {
+                        let sp = sub.path();
+                        if sp.is_file() && sp.extension().map_or(false, |e| e == "safetensors") {
+                            files.push(sp);
+                        }
+                    }
+                }
             }
         }
     }
+    files.sort();
     files
 }
 
-/// Executes the BitNet Absolute Mean Quantization and 2-bit Packing (4 weights per byte)
-fn quantize_to_packed_2bit(weights: &[f32]) -> Vec<u8> {
-    let mut sum_abs = 0.0;
-    for &w in weights {
-        sum_abs += w.abs();
+/// Group safetensor files by their parent directory.
+/// Returns a list of (display_name, directory_path, file_list).
+fn group_model_dirs(files: &[PathBuf], models_dir: &Path) -> Vec<(String, PathBuf, Vec<PathBuf>)> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+
+    for f in files {
+        let parent = f.parent().unwrap_or(models_dir).to_path_buf();
+        groups.entry(parent).or_default().push(f.clone());
     }
+
+    groups.into_iter().map(|(dir, files)| {
+        let name = if dir == models_dir {
+            // Files directly in models/ — use the first file's stem
+            files[0].file_stem().unwrap().to_string_lossy().to_string()
+        } else {
+            dir.file_name().unwrap().to_string_lossy().to_string()
+        };
+        let shard_info = if files.len() > 1 {
+            format!("{} ({} shards)", name, files.len())
+        } else {
+            name.clone()
+        };
+        (shard_info, dir, files)
+    }).collect()
+}
+
+fn quantize_to_packed_2bit(weights: &[f32]) -> (Vec<u8>, f32) {
+    let sum_abs: f32 = weights.iter().map(|w| w.abs()).sum();
     let gamma = sum_abs / (weights.len() as f32 + 1e-8);
 
-    // Ensure length is aligned to packing logic. Output is N / 4 bytes.
     let packed_len = (weights.len() + 3) / 4;
-    let mut packed_weights = vec![0u8; packed_len];
+    let mut packed = vec![0u8; packed_len];
 
-    for i in 0..weights.len() {
-        let scaled = weights[i] / gamma;
-        let clamped = scaled.clamp(-1.0, 1.0).round() as i8;
-
-        let encoded: u8 = match clamped {
+    for (i, &w) in weights.iter().enumerate() {
+        let scaled = w / gamma;
+        let q = scaled.clamp(-1.0, 1.0).round() as i8;
+        let encoded: u8 = match q {
             1 => 1,
             -1 => 2,
             _ => 0,
         };
-
         let byte_idx = i / 4;
         let bit_offset = (i % 4) * 2;
-
-        packed_weights[byte_idx] |= encoded << bit_offset;
+        packed[byte_idx] |= encoded << bit_offset;
     }
 
-    packed_weights
+    (packed, gamma)
+}
+
+/// Determines if a tensor should be quantized (2D weight matrices) or kept as f32
+/// (1D biases, norms, embeddings).
+fn should_quantize(name: &str, shape: &[usize]) -> bool {
+    // Keep norm weights, biases, and embeddings in f32
+    if name.contains("layernorm") || name.contains("norm") || name.contains("bias") {
+        return false;
+    }
+    if name.contains("embed_tokens") {
+        return false;
+    }
+    // Quantize 2D weight matrices
+    shape.len() == 2
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Next-Gen CPU/GPU AI Framework ---");
-    println!("--- Automated Post-Training Quantizer (PTQ) ---\n");
+    println!("--- Automated Post-Training Quantizer (PTQ) v2 ---");
+    println!("--- Now with manifest.json for proper model loading ---\n");
 
     let models_dir = Path::new("models");
     if !models_dir.exists() {
@@ -61,80 +148,172 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let files = get_safetensor_files(models_dir);
     if files.is_empty() {
         println!("No .safetensors models found in the 'models/' directory.");
-        println!("Please download a Hugging Face model and place its .safetensors file in the 'models/' folder.");
+        println!("Please download a Hugging Face model and place its .safetensors file(s) in 'models/'.");
         return Ok(());
     }
 
-    let file_names: Vec<String> = files.iter().map(|f| f.file_name().unwrap().to_string_lossy().to_string()).collect();
+    let groups = group_model_dirs(&files, models_dir);
+    let group_names: Vec<String> = groups.iter().map(|(name, _, _)| name.clone()).collect();
 
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Select a model to crush into 1.58-bit Ternary format")
         .default(0)
-        .items(&file_names)
+        .items(&group_names)
         .interact()?;
 
-    let selected_file = &files[selection];
-    println!("\nLoading {}...", selected_file.display());
+    let (ref display_name, ref model_dir, ref shard_files) = groups[selection];
+    println!("\nProcessing: {} ({} shard(s))", display_name, shard_files.len());
 
-    // 1. Read File
-    let mut f = File::open(selected_file)?;
-    let mut buffer = Vec::new();
-    f.read_to_end(&mut buffer)?;
+    // Try to load config.json from the model directory
+    let hf_config: HFConfig = if let Ok(cfg_str) = fs::read_to_string(model_dir.join("config.json")) {
+        serde_json::from_str(&cfg_str).unwrap_or_else(|_| default_hf_config())
+    } else {
+        println!("Warning: No config.json found. Using default Llama-3-8B dimensions.");
+        default_hf_config()
+    };
 
-    // 2. Deserialize SafeTensors
-    let tensors = SafeTensors::deserialize(&buffer)?;
-    let tensor_names: Vec<_> = tensors.names().into_iter().collect();
+    // Output directory
+    let stem = display_name.split(" (").next().unwrap_or(display_name);
+    let output_dir = models_dir.join(format!("{}_1_58bit", stem));
+    fs::create_dir_all(&output_dir)?;
 
-    println!("Found {} tensors in the model.", tensor_names.len());
+    let mut blob: Vec<u8> = Vec::new();
+    let mut tensor_metas: Vec<TensorMeta> = Vec::new();
+    let mut total_original = 0usize;
+    let mut total_packed = 0usize;
+    let mut total_tensors = 0usize;
 
-    let output_filename = format!("{}_1_58bit.bin", selected_file.file_stem().unwrap().to_string_lossy());
-    let output_path = models_dir.join(&output_filename);
-    let mut output_file = File::create(&output_path)?;
+    // Count total tensors across all shards for the progress bar
+    for shard_path in shard_files {
+        let mut f = File::open(shard_path)?;
+        let mut buffer = Vec::new();
+        f.read_to_end(&mut buffer)?;
+        let tensors = SafeTensors::deserialize(&buffer)?;
+        total_tensors += tensors.names().len();
+    }
 
-    // 3. Process Tensors with Real-time Progress Bar
-    let pb = ProgressBar::new(tensor_names.len() as u64);
+    let pb = ProgressBar::new(total_tensors as u64);
     pb.set_style(ProgressStyle::default_bar()
-        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} tensors ({eta}) | {msg}")?
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta}) | {msg}")?
         .progress_chars("##-"));
 
-    let mut total_original_bytes = 0;
-    let mut total_crushed_bytes = 0;
+    // Process each shard
+    for (shard_idx, shard_path) in shard_files.iter().enumerate() {
+        pb.set_message(format!("Shard {}/{}", shard_idx + 1, shard_files.len()));
 
-    for name in tensor_names {
-        pb.set_message(format!("Quantizing {}", name));
+        let mut f = File::open(shard_path)?;
+        let mut buffer = Vec::new();
+        f.read_to_end(&mut buffer)?;
 
-        let tensor = tensors.tensor(name)?;
-        let shape = tensor.shape();
+        let tensors = SafeTensors::deserialize(&buffer)?;
+        let tensor_names: Vec<String> = tensors.names().into_iter().map(|s| s.to_string()).collect();
 
-        // Extract raw f32 data
-        let data_bytes = tensor.data();
-        let float_data: &[f32] = unsafe {
-            std::slice::from_raw_parts(data_bytes.as_ptr() as *const f32, data_bytes.len() / 4)
-        };
+        for name in &tensor_names {
+            pb.set_message(format!("{}", name));
 
-        total_original_bytes += data_bytes.len();
+            let tensor = tensors.tensor(name)?;
+            let shape: Vec<usize> = tensor.shape().to_vec();
+            let data_bytes = tensor.data();
+            total_original += data_bytes.len();
 
-        // If it's a weight matrix (2D), we crush it into 2-bit packed array
-        // If it's a 1D bias or embedding, we might keep it FP32 in a real engine,
-        // but for this full-quantization demo, we crush all parameters uniformly.
-        let packed = quantize_to_packed_2bit(float_data);
-        total_crushed_bytes += packed.len();
+            let float_data: &[f32] = unsafe {
+                std::slice::from_raw_parts(data_bytes.as_ptr() as *const f32, data_bytes.len() / 4)
+            };
 
-        // Save to disk
-        // A robust format would serialize shapes and metadata headers.
-        // We write the raw binary for this optimized edge engine.
-        output_file.write_all(&packed)?;
+            let byte_offset = blob.len();
 
-        pb.inc(1);
+            if should_quantize(name, &shape) {
+                let (packed, gamma) = quantize_to_packed_2bit(float_data);
+                let byte_length = packed.len();
+                total_packed += byte_length;
+                blob.extend_from_slice(&packed);
+
+                tensor_metas.push(TensorMeta {
+                    name: name.clone(),
+                    shape,
+                    byte_offset,
+                    byte_length,
+                    gamma,
+                });
+            } else {
+                let byte_length = data_bytes.len();
+                total_packed += byte_length;
+                blob.extend_from_slice(data_bytes);
+
+                tensor_metas.push(TensorMeta {
+                    name: name.clone(),
+                    shape,
+                    byte_offset,
+                    byte_length,
+                    gamma: 0.0,
+                });
+            }
+
+            pb.inc(1);
+        }
     }
 
     pb.finish_with_message("Done!");
 
+    // Write blob
+    let mut blob_file = File::create(output_dir.join("weights.bin"))?;
+    blob_file.write_all(&blob)?;
+
+    // Write manifest
+    let manifest = ModelManifest {
+        model_type: hf_config.model_type.unwrap_or_else(|| "llama".to_string()),
+        hidden_dim: hf_config.hidden_size.unwrap_or(4096),
+        num_layers: hf_config.num_hidden_layers.unwrap_or(32),
+        num_heads: hf_config.num_attention_heads.unwrap_or(32),
+        num_kv_heads: hf_config.num_key_value_heads.unwrap_or(8),
+        vocab_size: hf_config.vocab_size.unwrap_or(128256),
+        max_seq_len: hf_config.max_position_embeddings.unwrap_or(8192),
+        intermediate_dim: hf_config.intermediate_size.unwrap_or(14336),
+        rope_theta: hf_config.rope_theta.unwrap_or(500000.0),
+        rms_norm_eps: hf_config.rms_norm_eps.unwrap_or(1e-5),
+        tensors: tensor_metas,
+    };
+
+    let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    fs::write(output_dir.join("manifest.json"), &manifest_json)?;
+
+    // Copy tokenizer.json if it exists in the source model directory
+    let tokenizer_src = model_dir.join("tokenizer.json");
+    if tokenizer_src.exists() {
+        fs::copy(&tokenizer_src, output_dir.join("tokenizer.json"))?;
+        println!("Copied tokenizer.json to output directory.");
+    } else {
+        println!("Note: No tokenizer.json found in source. You'll need to copy one manually.");
+    }
+
+    // Also copy tokenizer_config.json if present
+    let tok_config_src = model_dir.join("tokenizer_config.json");
+    if tok_config_src.exists() {
+        fs::copy(&tok_config_src, output_dir.join("tokenizer_config.json"))?;
+    }
+
     println!("\n--- Conversion Complete! ---");
-    println!("Original Size: {:.2} MB", total_original_bytes as f64 / 1_000_000.0);
-    println!("Crushed Size:  {:.2} MB", total_crushed_bytes as f64 / 1_000_000.0);
-    println!("Ratio:         {:.2}x Smaller!", (total_original_bytes as f64) / (total_crushed_bytes as f64));
-    println!("Saved as:      models/{}", output_filename);
+    println!("Original Size:  {:.2} MB", total_original as f64 / 1_000_000.0);
+    println!("Packed Size:    {:.2} MB", total_packed as f64 / 1_000_000.0);
+    println!("Ratio:          {:.1}x smaller", total_original as f64 / total_packed as f64);
+    println!("Output:         {}/", output_dir.display());
+    println!("  manifest.json - model config + tensor metadata");
+    println!("  weights.bin   - packed weight blob");
 
     Ok(())
+}
+
+fn default_hf_config() -> HFConfig {
+    HFConfig {
+        hidden_size: Some(4096),
+        num_hidden_layers: Some(32),
+        num_attention_heads: Some(32),
+        num_key_value_heads: Some(8),
+        vocab_size: Some(128256),
+        max_position_embeddings: Some(8192),
+        intermediate_size: Some(14336),
+        rope_theta: Some(500000.0),
+        rms_norm_eps: Some(1e-5),
+        model_type: Some("llama".to_string()),
+    }
 }

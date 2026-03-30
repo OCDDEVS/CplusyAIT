@@ -1,6 +1,10 @@
 use candle_core::{Tensor, Result};
 use candle_nn::{Linear, linear, VarBuilder, Module};
 
+/// DEPRECATED: This FP32 attention module is kept for reference and testing.
+/// For production inference, use `crate::inference::transformer::TransformerLayer`
+/// which routes Q/K/V/O projections through the AVX2 TernaryLinear kernel.
+///
 /// A standard Multi-Head Attention layer integrating standard RoPE (Rotary Positional Embeddings)
 /// with Document-wise resets for 100M token contexts as theorized by MSA.
 pub struct MultiHeadAttention {
