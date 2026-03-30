@@ -1,14 +1,10 @@
-pub mod ffi;
-pub mod core;
-pub mod memory;
-pub mod benchmark;
-pub mod inference;
+use cpu_ai_framework::core;
+use cpu_ai_framework::benchmark;
 
 fn main() {
     println!("Next-Gen CPU AI Framework Initialized.");
     println!("Targeting 1.58-bit Ternary Neural Networks and Memory Sparse Attention (MSA).");
 
-    // Example: Rust orchestrator setup for a 7B model execution
     let mut runtime = core::Runtime::new();
     runtime.initialize_memory_os();
 
