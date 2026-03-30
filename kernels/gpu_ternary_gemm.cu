@@ -11,7 +11,7 @@
 /// `packed_weights` (M x K / 4): 2-bit weights in uint8_t array.
 /// `activations` (K x N): Quantized Int8 activations.
 /// `output` (M x N): Accumulated Int32 outputs.
-extern "C" __global__ void ternary_gemm_dp4a_kernel(
+__global__ void ternary_gemm_dp4a_device(
     const uint8_t* __restrict__ packed_weights,
     const int8_t* __restrict__ activations,
     int32_t* __restrict__ output,
@@ -78,4 +78,44 @@ extern "C" __global__ void ternary_gemm_dp4a_kernel(
         // Store Int32 result
         output[row * n + col] = acc;
     }
+}
+
+// ─── Host-side C wrapper for FFI ────────────────────────────────────────────
+// Manages device memory allocation, H2D/D2H transfers, and kernel launch.
+
+extern "C" void ternary_gemm_dp4a_kernel(
+    const uint8_t* packed_weights,  // Host pointer: M * K / 4 bytes
+    const int8_t* activations,      // Host pointer: K * N bytes
+    int32_t* output,                // Host pointer: M * N int32s
+    int m,
+    int n,
+    int k
+) {
+    size_t weights_bytes = (size_t)m * k / 4;
+    size_t acts_bytes    = (size_t)k * n;
+    size_t out_bytes     = (size_t)m * n * sizeof(int32_t);
+
+    uint8_t* d_weights;
+    int8_t*  d_acts;
+    int32_t* d_output;
+
+    cudaMalloc(&d_weights, weights_bytes);
+    cudaMalloc(&d_acts, acts_bytes);
+    cudaMalloc(&d_output, out_bytes);
+
+    cudaMemcpy(d_weights, packed_weights, weights_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_acts, activations, acts_bytes, cudaMemcpyHostToDevice);
+    cudaMemset(d_output, 0, out_bytes);
+
+    // Launch kernel: 16x16 thread blocks
+    dim3 block(16, 16);
+    dim3 grid((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
+
+    ternary_gemm_dp4a_device<<<grid, block>>>(d_weights, d_acts, d_output, m, n, k);
+
+    cudaMemcpy(output, d_output, out_bytes, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_weights);
+    cudaFree(d_acts);
+    cudaFree(d_output);
 }

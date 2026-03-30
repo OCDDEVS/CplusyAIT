@@ -61,6 +61,7 @@ extern "C" {
     );
 
     /// (CUDA) GPU-Native Flash-MSA Routing Kernel (in Shared Memory)
+    #[cfg(feature = "cuda")]
     pub fn flash_msa_route_kernel(
         query_vectors: *const c_float,
         routing_keys: *const c_float,
@@ -72,6 +73,7 @@ extern "C" {
     );
 
     /// (CUDA) 1.58-bit Ternary GPU Kernels (__dp4a)
+    #[cfg(feature = "cuda")]
     pub fn ternary_gemm_dp4a_kernel(
         packed_weights: *const u8,
         activations: *const int8_t,
@@ -79,5 +81,17 @@ extern "C" {
         m: int32_t,
         n: int32_t,
         k: int32_t,
+    );
+
+    /// ARM NEON Ternary GEMM Kernel for aarch64.
+    /// Same interface as AVX2: 2-bit packed weights, int8 activations.
+    #[cfg(target_arch = "aarch64")]
+    pub fn ternary_gemm_neon_packed(
+        packed_weights: *const u8,
+        activations: *const i8,
+        output: *mut i32,
+        m: usize,
+        n: usize,
+        k: usize,
     );
 }

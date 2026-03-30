@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process;
 
 use cpu_ai_framework::inference::format::PackedModel;
-use cpu_ai_framework::inference::transformer::TernaryTransformer;
+use cpu_ai_framework::inference::transformer::{TernaryTransformer, MixingMode};
 use cpu_ai_framework::inference::sampler::SamplingStrategy;
 use cpu_ai_framework::inference::generate::{generate_streaming, GenerateConfig};
 use cpu_ai_framework::inference::tokenizer::TokenizerWrapper;
@@ -21,6 +21,8 @@ fn main() {
     let mut temperature: f32 = 0.7;
     let mut top_k: usize = 40;
     let mut kv_budget_mb: usize = 0; // 0 = unlimited
+    let mut mixing_mode = MixingMode::Attention;
+    let mut doc_boundary_token: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -31,6 +33,22 @@ fn main() {
             "--temperature" => { i += 1; temperature = args[i].parse().unwrap_or(0.7); }
             "--top-k" => { i += 1; top_k = args[i].parse().unwrap_or(40); }
             "--kv-budget" => { i += 1; kv_budget_mb = args[i].parse().unwrap_or(0); }
+            "--mixing-mode" => {
+                i += 1;
+                mixing_mode = match args[i].as_str() {
+                    "attention" => MixingMode::Attention,
+                    "mamba" => MixingMode::Mamba,
+                    "hybrid" => MixingMode::Hybrid,
+                    other => {
+                        eprintln!("Unknown mixing mode: '{}'. Use: attention, mamba, hybrid", other);
+                        process::exit(1);
+                    }
+                };
+            }
+            "--doc-boundary" => {
+                i += 1;
+                doc_boundary_token = Some(args[i].clone());
+            }
             "--help" | "-h" => {
                 print_usage();
                 process::exit(0);
@@ -63,6 +81,17 @@ fn main() {
     println!("Building transformer ({} layers, hidden_dim={}, vocab={})...",
         packed.manifest.num_layers, packed.manifest.hidden_dim, packed.manifest.vocab_size);
     let mut model = TernaryTransformer::from_packed(&packed);
+
+    // Set mixing mode (attention/mamba/hybrid)
+    model.mixing_mode = mixing_mode;
+    if mixing_mode != MixingMode::Attention {
+        if model.mamba_cache.is_none() {
+            eprintln!("Warning: --mixing-mode {:?} requested but model has no Mamba weights. Falling back to attention.", mixing_mode);
+            model.mixing_mode = MixingMode::Attention;
+        } else {
+            println!("Mixing mode: {:?}", mixing_mode);
+        }
+    }
 
     // Set KV cache memory budget if specified
     if kv_budget_mb > 0 {
@@ -102,10 +131,36 @@ fn main() {
         SamplingStrategy::TopK { k: top_k, temperature }
     };
 
+    // Resolve document boundary tokens for Document-level RoPE
+    let doc_boundary_tokens = if let Some(ref boundary_str) = doc_boundary_token {
+        // Try to encode the boundary string as a token ID
+        if let Ok(id) = boundary_str.parse::<u32>() {
+            // Numeric: treat as raw token ID
+            println!("Document-level RoPE enabled (boundary token ID: {})", id);
+            vec![id]
+        } else if let Some(ref tok) = tokenizer {
+            // String: encode it to get the token ID(s)
+            let ids = tok.encode(boundary_str, false).unwrap_or_default();
+            if ids.is_empty() {
+                eprintln!("Warning: --doc-boundary '{}' produced no tokens. Document RoPE disabled.", boundary_str);
+                Vec::new()
+            } else {
+                println!("Document-level RoPE enabled (boundary tokens: {:?})", ids);
+                ids
+            }
+        } else {
+            eprintln!("Warning: --doc-boundary requires a tokenizer or numeric token ID.");
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
     let config = GenerateConfig {
         max_tokens,
         strategy,
         eos_token_id: eos_id,
+        doc_boundary_tokens,
     };
 
     println!("\n--- Generating (max {} tokens) ---", max_tokens);
@@ -131,13 +186,16 @@ fn main() {
 }
 
 fn print_usage() {
-    println!("Usage: infer --model <path> [--prompt <text>] [--max-tokens <n>] [--temperature <f>] [--top-k <n>] [--kv-budget <MB>]");
+    println!("Usage: infer --model <path> [--prompt <text>] [--max-tokens <n>] [--temperature <f>] [--top-k <n>] [--kv-budget <MB>] [--mixing-mode <mode>] [--doc-boundary <token>]");
     println!();
     println!("Options:");
-    println!("  --model        Path to quantized model dir (manifest.json + weights.bin + tokenizer.json)");
-    println!("  --prompt       Input prompt text (default: \"Hello\")");
-    println!("  --max-tokens   Maximum tokens to generate (default: 256)");
-    println!("  --temperature  Sampling temperature (default: 0.7, use 0 for greedy)");
-    println!("  --top-k        Top-K sampling (default: 40)");
-    println!("  --kv-budget    KV cache memory budget in MB (default: unlimited)");
+    println!("  --model          Path to quantized model dir (manifest.json + weights.bin + tokenizer.json)");
+    println!("  --prompt         Input prompt text (default: \"Hello\")");
+    println!("  --max-tokens     Maximum tokens to generate (default: 256)");
+    println!("  --temperature    Sampling temperature (default: 0.7, use 0 for greedy)");
+    println!("  --top-k          Top-K sampling (default: 40)");
+    println!("  --kv-budget      KV cache memory budget in MB (default: unlimited)");
+    println!("  --mixing-mode    Sequence mixing: attention (default), mamba, or hybrid");
+    println!("  --doc-boundary   Token or ID marking document boundaries for RoPE reset");
+    println!("                   (e.g. \"<doc>\" or a numeric token ID like 2)");
 }

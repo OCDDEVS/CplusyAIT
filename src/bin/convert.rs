@@ -29,6 +29,8 @@ struct ModelManifest {
     rope_theta: f64,
     rms_norm_eps: f64,
     tensors: Vec<TensorMeta>,
+    #[serde(default)]
+    mamba_state_dim: Option<usize>,
 }
 
 /// Simple HF config.json fields we care about.
@@ -135,6 +137,30 @@ fn should_quantize(name: &str, shape: &[usize]) -> bool {
     shape.len() == 2
 }
 
+/// Convert raw tensor bytes to f32, handling bf16/f16 formats.
+fn bytes_to_f32(data: &[u8], num_elements: usize) -> Vec<f32> {
+    if data.len() == num_elements * 4 {
+        let mut out = vec![0.0f32; num_elements];
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out.as_mut_ptr() as *mut u8, data.len());
+        }
+        out
+    } else if data.len() == num_elements * 2 {
+        // bf16: shift left 16 bits to get f32
+        let mut out = vec![0.0f32; num_elements];
+        for i in 0..num_elements {
+            let lo = data[i * 2] as u16;
+            let hi = data[i * 2 + 1] as u16;
+            let bits = lo | (hi << 8);
+            let f32_bits = (bits as u32) << 16;
+            out[i] = f32::from_bits(f32_bits);
+        }
+        out
+    } else {
+        panic!("Unexpected data size: {} bytes for {} elements", data.len(), num_elements);
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Next-Gen CPU/GPU AI Framework ---");
     println!("--- Automated Post-Training Quantizer (PTQ) v2 ---");
@@ -216,14 +242,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let data_bytes = tensor.data();
             total_original += data_bytes.len();
 
-            let float_data: &[f32] = unsafe {
-                std::slice::from_raw_parts(data_bytes.as_ptr() as *const f32, data_bytes.len() / 4)
-            };
+            let num_elements: usize = shape.iter().product();
+            let float_data = bytes_to_f32(data_bytes, num_elements);
 
             let byte_offset = blob.len();
 
             if should_quantize(name, &shape) {
-                let (packed, gamma) = quantize_to_packed_2bit(float_data);
+                let (packed, gamma) = quantize_to_packed_2bit(&float_data);
                 let byte_length = packed.len();
                 total_packed += byte_length;
                 blob.extend_from_slice(&packed);
@@ -236,9 +261,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     gamma,
                 });
             } else {
-                let byte_length = data_bytes.len();
+                // Store as f32 bytes
+                let f32_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(float_data.as_ptr() as *const u8, float_data.len() * 4)
+                };
+                let byte_length = f32_bytes.len();
                 total_packed += byte_length;
-                blob.extend_from_slice(data_bytes);
+                blob.extend_from_slice(f32_bytes);
 
                 tensor_metas.push(TensorMeta {
                     name: name.clone(),
@@ -260,18 +289,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     blob_file.write_all(&blob)?;
 
     // Write manifest
+    // Write manifest — infer missing config values from actual tensor shapes
+    let hidden_dim = hf_config.hidden_size.unwrap_or_else(|| {
+        tensor_metas.iter()
+            .find(|m| m.name.contains("embed_tokens"))
+            .map(|m| *m.shape.last().unwrap_or(&4096))
+            .unwrap_or(4096)
+    });
+    let vocab_size = hf_config.vocab_size.unwrap_or_else(|| {
+        tensor_metas.iter()
+            .find(|m| m.name.contains("embed_tokens"))
+            .map(|m| m.shape[0])
+            .unwrap_or(32000)
+    });
+    let num_layers = hf_config.num_hidden_layers.unwrap_or_else(|| {
+        tensor_metas.iter()
+            .filter_map(|m| {
+                m.name.strip_prefix("model.layers.")
+                    .and_then(|s| s.split('.').next())
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(32)
+    });
+    let intermediate_dim = hf_config.intermediate_size.unwrap_or_else(|| {
+        tensor_metas.iter()
+            .find(|m| m.name.contains("gate_proj"))
+            .map(|m| m.shape[0])
+            .unwrap_or(14336)
+    });
+    let num_heads = hf_config.num_attention_heads.unwrap_or_else(|| {
+        if hidden_dim > 0 { (hidden_dim / 64).max(1) } else { 32 }
+    });
+
     let manifest = ModelManifest {
         model_type: hf_config.model_type.unwrap_or_else(|| "llama".to_string()),
-        hidden_dim: hf_config.hidden_size.unwrap_or(4096),
-        num_layers: hf_config.num_hidden_layers.unwrap_or(32),
-        num_heads: hf_config.num_attention_heads.unwrap_or(32),
-        num_kv_heads: hf_config.num_key_value_heads.unwrap_or(8),
-        vocab_size: hf_config.vocab_size.unwrap_or(128256),
+        hidden_dim,
+        num_layers,
+        num_heads,
+        num_kv_heads: hf_config.num_key_value_heads.unwrap_or(num_heads),
+        vocab_size,
         max_seq_len: hf_config.max_position_embeddings.unwrap_or(8192),
-        intermediate_dim: hf_config.intermediate_size.unwrap_or(14336),
+        intermediate_dim,
         rope_theta: hf_config.rope_theta.unwrap_or(500000.0),
         rms_norm_eps: hf_config.rms_norm_eps.unwrap_or(1e-5),
         tensors: tensor_metas,
+        mamba_state_dim: None,
     };
 
     let manifest_json = serde_json::to_string_pretty(&manifest)?;

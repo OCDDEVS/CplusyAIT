@@ -61,6 +61,8 @@ impl LayerKVCache {
 
     /// MSA Routing: given a query vector, find the top-k most relevant cached
     /// positions using the C++ cosine similarity router.
+    /// When compiled with `--features cuda`, uses the GPU Flash-MSA kernel
+    /// with SRAM-based routing for zero-copy performance.
     /// Returns (selected_keys, selected_values, indices) where keys/values
     /// contain only the top-k positions' data.
     pub fn msa_select_top_k(&self, query: &[f32], k: usize) -> (Vec<f32>, Vec<f32>, Vec<i32>) {
@@ -73,15 +75,25 @@ impl LayerKVCache {
 
         let actual_k = k.min(num_positions);
 
-        // Use the C++ MSA router to find top-k positions by cosine similarity
-        // The router compares `query` against each position's key vector
         let mut top_k_indices = vec![0i32; actual_k];
 
-        // We need to match query dim to key dim. If query is hidden_dim and keys
-        // are kv_dim (num_kv_heads * head_dim), we use the first kv_dim elements.
         let query_dim = query.len().min(kv_dim);
         let routing_query = &query[..query_dim];
 
+        #[cfg(feature = "cuda")]
+        unsafe {
+            ffi::flash_msa_route_kernel(
+                routing_query.as_ptr(),
+                self.keys.as_ptr(),
+                top_k_indices.as_mut_ptr(),
+                1,                    // single query
+                num_positions as i32,
+                kv_dim as i32,
+                actual_k as i32,
+            );
+        }
+
+        #[cfg(not(feature = "cuda"))]
         unsafe {
             ffi::msa_route_top_k(
                 routing_query.as_ptr(),

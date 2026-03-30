@@ -9,12 +9,18 @@ fn main() {
         .file("kernels/msa_router.cpp")
         .file("kernels/memory_paging.cpp")
         .flag_if_supported("-O3")
-        .flag_if_supported("-std=c++17");
+        .flag_if_supported("-std=c++17")
+        .static_crt(true);
 
     // Only compile the AVX2 SIMD kernel if the target architecture is x86_64
     if target_arch == "x86_64" {
         builder.file("kernels/cpu_ternary_gemm_avx2.cpp")
                .flag_if_supported("-mavx2");
+    }
+
+    // Compile ARM NEON kernel for aarch64 (Apple Silicon, ARM servers, mobile)
+    if target_arch == "aarch64" {
+        builder.file("kernels/cpu_ternary_gemm_neon.cpp");
     }
 
     builder.compile("cpu_ai_kernels");
@@ -40,5 +46,8 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/memory_paging.cpp");
     if target_arch == "x86_64" {
         println!("cargo:rerun-if-changed=kernels/cpu_ternary_gemm_avx2.cpp");
+    }
+    if target_arch == "aarch64" {
+        println!("cargo:rerun-if-changed=kernels/cpu_ternary_gemm_neon.cpp");
     }
 }

@@ -10,6 +10,11 @@ pub struct GenerateConfig {
     pub strategy: SamplingStrategy,
     /// EOS token ID — generation stops when this is produced.
     pub eos_token_id: u32,
+    /// Token IDs that mark document boundaries for Document-level RoPE.
+    /// When non-empty, enables document-level position resets during generation.
+    /// The RoPE position counter resets to 0 after each boundary token,
+    /// allowing multi-document prompts to avoid RoPE frequency overflow.
+    pub doc_boundary_tokens: Vec<u32>,
 }
 
 /// Result of a generation run.
@@ -43,6 +48,19 @@ where
     F: FnMut(u32),
 {
     model.kv_cache.clear();
+    if let Some(ref mut mc) = model.mamba_cache {
+        mc.clear();
+    }
+
+    // Configure document-level RoPE if boundary tokens are specified
+    if !config.doc_boundary_tokens.is_empty() {
+        model.doc_rope = crate::inference::transformer::DocumentRoPE::new(
+            config.doc_boundary_tokens.clone(),
+        );
+    } else {
+        model.doc_rope.reset();
+    }
+
     let mut output_tokens: Vec<u32> = Vec::new();
 
     let start = Instant::now();

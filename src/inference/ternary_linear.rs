@@ -1,5 +1,6 @@
 //! A ternary linear layer that uses the AVX2 packed GEMM kernel for inference.
 //! Replaces standard FP32 matmul with 1.58-bit ternary computation.
+//! When compiled with `--features cuda`, dispatches to the GPU __dp4a kernel.
 
 use crate::ffi;
 
@@ -23,6 +24,12 @@ impl TernaryLinear {
     /// Forward pass: input is f32 slice of length `batch * in_features`.
     /// Output is f32 slice of length `batch * out_features`.
     /// For autoregressive decoding, batch is typically 1.
+    ///
+    /// Dispatch order:
+    /// 1. `cuda` feature → GPU __dp4a kernel
+    /// 2. x86_64 + AVX2 → CPU AVX2 SIMD kernel
+    /// 3. aarch64 → ARM NEON kernel
+    /// 4. Scalar fallback
     pub fn forward(&self, input: &[f32], batch: usize) -> Vec<f32> {
         let k = self.in_features;
         let n = batch; // columns of the activation matrix
@@ -41,27 +48,54 @@ impl TernaryLinear {
             acts_i8[i] = (v / act_scale).round().clamp(-127.0, 127.0) as i8;
         }
 
-        // 2. Call AVX2 kernel: Output(M, N) = Weights(M, K) * Acts(K, N)
+        // 2. Call compute kernel: Output(M, N) = Weights(M, K) * Acts(K, N)
         let mut output_i32 = vec![0i32; m * n];
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(feature = "cuda")]
         {
-            if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                ffi::ternary_gemm_dp4a_kernel(
+                    self.packed_weights.as_ptr(),
+                    acts_i8.as_ptr(),
+                    output_i32.as_mut_ptr(),
+                    m as i32, n as i32, k as i32,
+                );
+            }
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avx2") {
+                    unsafe {
+                        ffi::ternary_gemm_avx2_packed(
+                            self.packed_weights.as_ptr(),
+                            acts_i8.as_ptr(),
+                            output_i32.as_mut_ptr(),
+                            m, n, k,
+                        );
+                    }
+                } else {
+                    self.scalar_fallback(&acts_i8, &mut output_i32, m, n, k);
+                }
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
                 unsafe {
-                    ffi::ternary_gemm_avx2_packed(
+                    ffi::ternary_gemm_neon_packed(
                         self.packed_weights.as_ptr(),
                         acts_i8.as_ptr(),
                         output_i32.as_mut_ptr(),
                         m, n, k,
                     );
                 }
-            } else {
-                self.scalar_fallback(&acts_i8, &mut output_i32, m, n, k);
             }
-        }
 
-        #[cfg(not(target_arch = "x86_64"))]
-        self.scalar_fallback(&acts_i8, &mut output_i32, m, n, k);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            self.scalar_fallback(&acts_i8, &mut output_i32, m, n, k);
+        }
 
         // 3. Dequantize: out_f32 = out_i32 * gamma * act_scale
         let dequant = self.gamma * act_scale;

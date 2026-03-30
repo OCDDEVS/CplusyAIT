@@ -10,7 +10,7 @@
 /// `query_vectors` (Batch x Dim)
 /// `routing_keys` (NumKeys x Dim) -> The MemScene Centroids
 /// `top_k_indices_out` (Batch x K) -> The matched indices
-extern "C" __global__ void flash_msa_route_kernel(
+extern "C" __global__ void flash_msa_route_device(
     const float* __restrict__ query_vectors,
     const float* __restrict__ routing_keys,
     int32_t* __restrict__ top_k_indices_out,
@@ -88,4 +88,47 @@ extern "C" __global__ void flash_msa_route_kernel(
             top_k_indices_out[query_idx * k + i] = top_indices[i];
         }
     }
+}
+
+// ─── Host-side C wrapper for FFI ────────────────────────────────────────────
+// Manages device memory, H2D/D2H transfers, and kernel launch with shared memory.
+
+extern "C" void flash_msa_route_kernel(
+    const float* query_vectors,      // Host pointer: num_queries * vector_dim
+    const float* routing_keys,       // Host pointer: num_keys * vector_dim
+    int32_t* top_k_indices_out,      // Host pointer: num_queries * k
+    int num_queries,
+    int num_keys,
+    int vector_dim,
+    int k
+) {
+    size_t queries_bytes = (size_t)num_queries * vector_dim * sizeof(float);
+    size_t keys_bytes    = (size_t)num_keys * vector_dim * sizeof(float);
+    size_t indices_bytes = (size_t)num_queries * k * sizeof(int32_t);
+
+    float*   d_queries;
+    float*   d_keys;
+    int32_t* d_indices;
+
+    cudaMalloc(&d_queries, queries_bytes);
+    cudaMalloc(&d_keys, keys_bytes);
+    cudaMalloc(&d_indices, indices_bytes);
+
+    cudaMemcpy(d_queries, query_vectors, queries_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_keys, routing_keys, keys_bytes, cudaMemcpyHostToDevice);
+
+    // One block per query, threads = vector_dim (capped at 1024)
+    int threads = (vector_dim < 1024) ? vector_dim : 1024;
+    size_t shared_mem = vector_dim * sizeof(float);
+
+    flash_msa_route_device<<<num_queries, threads, shared_mem>>>(
+        d_queries, d_keys, d_indices,
+        num_queries, num_keys, vector_dim, k
+    );
+
+    cudaMemcpy(top_k_indices_out, d_indices, indices_bytes, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_queries);
+    cudaFree(d_keys);
+    cudaFree(d_indices);
 }

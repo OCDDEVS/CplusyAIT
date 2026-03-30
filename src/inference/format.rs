@@ -35,6 +35,10 @@ pub struct ModelManifest {
     pub rope_theta: f64,
     pub rms_norm_eps: f64,
     pub tensors: Vec<TensorMeta>,
+    /// Mamba SSM state dimension. When present (> 0), the model contains
+    /// Mamba weights for hybrid attention/SSM inference.
+    #[serde(default)]
+    pub mamba_state_dim: Option<usize>,
 }
 
 /// A loaded model: manifest + raw packed bytes in memory.

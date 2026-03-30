@@ -6,3 +6,4 @@ pub mod sampler;
 pub mod generate;
 pub mod tokenizer;
 pub mod chat_template;
+pub mod mamba;
