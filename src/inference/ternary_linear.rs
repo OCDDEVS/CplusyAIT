@@ -54,7 +54,7 @@ impl TernaryLinear {
             let a = v.abs();
             if a > max_abs { max_abs = a; }
         }
-        let act_scale = max_abs / 127.0 + 1e-8;
+        let act_scale = if max_abs < 1e-8 { 1e-8 } else { max_abs / 127.0 };
 
         let mut acts_i8 = vec![0i8; input.len()];
         for (i, &v) in input.iter().enumerate() {

@@ -90,7 +90,7 @@ impl TernarySTEModel {
             if act.abs() > max_abs { max_abs = act.abs(); }
         }
         // scale to fit exactly in [-127, 127]
-        self.current_act_scale = max_abs / 127.0 + 1e-8;
+        self.current_act_scale = if max_abs < 1e-8 { 1e-8 } else { max_abs / 127.0 };
 
         let mut activations_int8 = vec![0i8; activations_f32.len()];
         for i in 0..activations_f32.len() {

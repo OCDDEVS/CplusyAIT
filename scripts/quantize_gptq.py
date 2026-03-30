@@ -271,12 +271,63 @@ def quantize_model(model_id, output_dir, nsamples=32, seqlen=1024, device="cpu",
 
     print(f"Model loaded. RAM usage: {get_ram_usage_gb():.1f} GB")
 
-    # We do NOT need calibration data for the weight-only Hessian approximation.
-    # The original script loaded 128*2048 token samples (~2GB) but never actually
-    # used them — the collect_hessian() function was defined but never called.
-    # The loop uses col_norms from weights as a diagonal Hessian proxy.
-    # So we skip calibration entirely to save ~2GB of RAM.
-    print("Using weight-statistics Hessian (no calibration data needed)")
+    # Collect calibration data for the real activation Hessian (H = X^T X).
+    # GPTQ *requires* the activation Hessian to know which weight errors matter.
+    # Using weight-only statistics (W^T W) as a proxy is fundamentally wrong —
+    # it tells the algorithm "columns with large weights are important" instead
+    # of "columns that receive large activations are important". The error
+    # compensation then pushes quantization noise into the wrong columns,
+    # corrupting the model and producing degenerate output (e.g. "befbefbef").
+    print("Collecting calibration data for activation Hessian...")
+    calib_samples = get_calibration_data(tokenizer, nsamples=nsamples, seqlen=seqlen)
+
+    # Build a map: layer_name -> activation Hessian (H = X^T X / nsamples)
+    # We hook into each linear layer, accumulate X^T X, then remove hooks.
+    print("Computing per-layer activation Hessians...")
+    hessian_map = {}
+    hook_handles = []
+
+    def make_hessian_hook(name):
+        def hook(module, inp, out):
+            x = inp[0].detach().float()  # (batch, seq, in_features) or (batch, in_features)
+            if x.dim() == 3:
+                x = x.reshape(-1, x.shape[-1])  # (batch*seq, in_features)
+            elif x.dim() == 1:
+                x = x.unsqueeze(0)
+            # Accumulate X^T X
+            xtx = x.T @ x  # (in_features, in_features)
+            if name in hessian_map:
+                hessian_map[name] += xtx
+            else:
+                hessian_map[name] = xtx
+        return hook
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and should_quantize(name + ".weight"):
+            h = module.register_forward_hook(make_hessian_hook(name + ".weight"))
+            hook_handles.append(h)
+
+    # Run calibration samples through the model
+    with torch.no_grad():
+        for i, sample in enumerate(calib_samples):
+            sample = sample.to(device)
+            try:
+                model(sample)
+            except Exception:
+                pass  # Some samples may be too long; skip them
+            if (i + 1) % 8 == 0:
+                print(f"  Calibration: {i+1}/{len(calib_samples)} samples")
+
+    # Remove hooks and normalize
+    for h in hook_handles:
+        h.remove()
+    del hook_handles, calib_samples
+    force_gc()
+
+    total_hessians = len(hessian_map)
+    for name in hessian_map:
+        hessian_map[name] /= nsamples
+    print(f"  Collected {total_hessians} activation Hessians. RAM: {get_ram_usage_gb():.1f} GB")
 
     config = model.config
     hidden_dim = config.hidden_size
@@ -323,11 +374,17 @@ def quantize_model(model_id, output_dir, nsamples=32, seqlen=1024, device="cpu",
             W = param.data.float()
             m, k = W.shape
 
-            # Compute diagonal Hessian approximation from weight statistics
+            # Use the real activation Hessian (X^T X) when available.
+            # Fall back to weight-statistics proxy only for layers we missed.
             with torch.no_grad():
-                col_norms = (W * W).sum(dim=0)
-                H = torch.diag(col_norms) + 1e-6 * torch.eye(k)
-                del col_norms
+                if name in hessian_map:
+                    H = hessian_map.pop(name).to(W.device)  # pop to free memory
+                else:
+                    # Fallback: diagonal proxy (much worse, but better than nothing)
+                    print(f"    Warning: no activation Hessian for {name}, using weight proxy")
+                    col_norms = (W * W).sum(dim=0)
+                    H = torch.diag(col_norms) + 1e-6 * torch.eye(k, device=W.device)
+                    del col_norms
 
             # Run GPTQ quantizer
             with torch.no_grad():
