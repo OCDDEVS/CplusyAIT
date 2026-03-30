@@ -6,19 +6,32 @@ use crate::ffi;
 
 /// A pre-quantized linear layer: stores 2-bit packed weights and the gamma scale.
 /// Computes: output = (packed_weights @ quantized_activations) * gamma * act_scale
+///
+/// Supports two modes:
+/// - Scalar gamma: a single scale factor for the entire layer (simple PTQ path).
+/// - Per-channel gammas: one scale factor per output row (GPTQ path).
+///   When per-channel gammas are present, each output row `i` is scaled by
+///   `channel_gammas[i]` instead of the scalar `gamma`.
 pub struct TernaryLinear {
     /// 2-bit packed weights, shape conceptually (out_features, in_features),
     /// stored as (out_features * in_features / 4) bytes.
     pub packed_weights: Vec<u8>,
     pub in_features: usize,
     pub out_features: usize,
-    /// BitNet absolute-mean scale factor.
+    /// BitNet absolute-mean scale factor (scalar, used when channel_gammas is empty).
     pub gamma: f32,
+    /// Per-channel (per-row) gamma values from GPTQ quantization.
+    /// When non-empty, `channel_gammas[i]` is used instead of `gamma` for row `i`.
+    pub channel_gammas: Vec<f32>,
 }
 
 impl TernaryLinear {
     pub fn new(packed_weights: Vec<u8>, in_features: usize, out_features: usize, gamma: f32) -> Self {
-        Self { packed_weights, in_features, out_features, gamma }
+        Self { packed_weights, in_features, out_features, gamma, channel_gammas: Vec::new() }
+    }
+
+    pub fn with_channel_gammas(packed_weights: Vec<u8>, in_features: usize, out_features: usize, gamma: f32, channel_gammas: Vec<f32>) -> Self {
+        Self { packed_weights, in_features, out_features, gamma, channel_gammas }
     }
 
     /// Forward pass: input is f32 slice of length `batch * in_features`.
@@ -97,11 +110,22 @@ impl TernaryLinear {
             self.scalar_fallback(&acts_i8, &mut output_i32, m, n, k);
         }
 
-        // 3. Dequantize: out_f32 = out_i32 * gamma * act_scale
-        let dequant = self.gamma * act_scale;
+        // 3. Dequantize: out_f32[row, col] = out_i32[row, col] * gamma_row * act_scale
+        // When per-channel gammas are available, each output row uses its own scale.
         let mut output_f32 = vec![0.0f32; m * n];
-        for i in 0..output_f32.len() {
-            output_f32[i] = output_i32[i] as f32 * dequant;
+        if !self.channel_gammas.is_empty() {
+            for row in 0..m {
+                let row_gamma = self.channel_gammas[row];
+                let dequant = row_gamma * act_scale;
+                for col in 0..n {
+                    output_f32[row * n + col] = output_i32[row * n + col] as f32 * dequant;
+                }
+            }
+        } else {
+            let dequant = self.gamma * act_scale;
+            for i in 0..output_f32.len() {
+                output_f32[i] = output_i32[i] as f32 * dequant;
+            }
         }
 
         output_f32

@@ -678,7 +678,30 @@ fn load_ternary_linear(model: &PackedModel, name: &str) -> TernaryLinear {
         .unwrap_or_else(|| panic!("Missing tensor (tried alternatives): {}", name));
     let out_features = meta.shape[0];
     let in_features = meta.shape[1];
-    TernaryLinear::new(data.to_vec(), in_features, out_features, meta.gamma)
+
+    // Check for per-channel gammas (written by GPTQ quantizer as "name.__gamma__")
+    let gamma_name = format!("{}.__gamma__", meta.name);
+    let channel_gammas = if let Some((_gm, gdata)) = model.get_tensor_data(&gamma_name) {
+        // Per-channel gammas stored as f32 array
+        let num_floats = gdata.len() / 4;
+        let mut gammas = vec![0.0f32; num_floats];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                gdata.as_ptr(),
+                gammas.as_mut_ptr() as *mut u8,
+                gdata.len(),
+            );
+        }
+        gammas
+    } else {
+        Vec::new()
+    };
+
+    if !channel_gammas.is_empty() {
+        TernaryLinear::with_channel_gammas(data.to_vec(), in_features, out_features, meta.gamma, channel_gammas)
+    } else {
+        TernaryLinear::new(data.to_vec(), in_features, out_features, meta.gamma)
+    }
 }
 
 fn load_rms_norm(model: &PackedModel, name: &str, dim: usize, eps: f64) -> RMSNorm {
