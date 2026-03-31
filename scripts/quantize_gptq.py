@@ -269,6 +269,11 @@ def quantize_model(model_id, output_dir, nsamples=32, seqlen=1024, device="cpu",
         )
     model.eval()
 
+    # Move model to target device (cuda speeds up calibration ~10x)
+    if device != "cpu":
+        model = model.to(device)
+        print(f"Model moved to {device}")
+
     print(f"Model loaded. RAM usage: {get_ram_usage_gb():.1f} GB")
 
     # Collect calibration data for the real activation Hessian (H = X^T X).
