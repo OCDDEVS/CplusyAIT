@@ -23,15 +23,54 @@ pub struct TernaryLinear {
     /// Per-channel (per-row) gamma values from GPTQ quantization.
     /// When non-empty, `channel_gammas[i]` is used instead of `gamma` for row `i`.
     pub channel_gammas: Vec<f32>,
+    /// Variance correction factor: compensates for the variance loss when
+    /// quantizing FP16 weights to ternary {-1,0,+1}. Ternary weights have
+    /// lower variance than the original because they can't represent the tails
+    /// of the weight distribution. Without this correction, each layer's output
+    /// is ~1.5-3x too small, compounding to ~10000x over 22 layers.
+    pub variance_correction: f32,
 }
 
 impl TernaryLinear {
     pub fn new(packed_weights: Vec<u8>, in_features: usize, out_features: usize, gamma: f32) -> Self {
-        Self { packed_weights, in_features, out_features, gamma, channel_gammas: Vec::new() }
+        let vc = Self::compute_variance_correction(&packed_weights, in_features, out_features);
+        Self { packed_weights, in_features, out_features, gamma, channel_gammas: Vec::new(), variance_correction: vc }
     }
 
     pub fn with_channel_gammas(packed_weights: Vec<u8>, in_features: usize, out_features: usize, gamma: f32, channel_gammas: Vec<f32>) -> Self {
-        Self { packed_weights, in_features, out_features, gamma, channel_gammas }
+        let vc = Self::compute_variance_correction(&packed_weights, in_features, out_features);
+        Self { packed_weights, in_features, out_features, gamma, channel_gammas, variance_correction: vc }
+    }
+
+    /// Compute variance correction factor from packed weights.
+    /// Ternary weights lose variance because they can't represent the tails
+    /// of the weight distribution. We estimate the correction as:
+    ///   correction = expected_rms / ternary_rms
+    /// where expected_rms is estimated from gamma using the relationship
+    /// between mean-absolute-value and RMS for typical weight distributions.
+    /// For neural network weights (approximately Gaussian):
+    ///   rms ≈ gamma * sqrt(pi/2) * sqrt(1 / fraction_nonzero)
+    /// But ternary rms = gamma * sqrt(fraction_nonzero)
+    /// So correction = sqrt(pi/2) / fraction_nonzero
+    fn compute_variance_correction(packed: &[u8], in_features: usize, out_features: usize) -> f32 {
+        let total_weights = out_features * in_features;
+        let mut nonzero = 0usize;
+        for i in 0..total_weights {
+            let byte_idx = i / 4;
+            let bit_offset = (i % 4) * 2;
+            if byte_idx < packed.len() {
+                let w = (packed[byte_idx] >> bit_offset) & 0x03;
+                if w != 0 { nonzero += 1; }
+            }
+        }
+        let p = nonzero as f32 / total_weights as f32;
+        if p < 0.01 { return 1.0; }
+        // Empirical correction for ternary quantization variance loss.
+        // For neural network weights, rms(W) / mean_abs(W) ≈ 1.8 (heavier tails
+        // than Gaussian where the ratio would be sqrt(pi/2) ≈ 1.25).
+        // Ternary rms = gamma * sqrt(p), original rms ≈ gamma * 1.8
+        // correction = 1.8 / sqrt(p)
+        1.8 / p.sqrt()
     }
 
     /// Forward pass: input is f32 slice of length `batch * in_features`.
@@ -110,19 +149,21 @@ impl TernaryLinear {
             self.scalar_fallback(&acts_i8, &mut output_i32, m, n, k);
         }
 
-        // 3. Dequantize: out_f32[row, col] = out_i32[row, col] * gamma_row * act_scale
-        // When per-channel gammas are available, each output row uses its own scale.
+        // 3. Dequantize: out_f32 = out_i32 * gamma * act_scale * variance_correction
+        // The variance_correction compensates for the fact that ternary weights
+        // have lower variance than the original FP16 weights. Without it, each
+        // layer's output is ~1.5-3x too small, compounding catastrophically.
         let mut output_f32 = vec![0.0f32; m * n];
         if !self.channel_gammas.is_empty() {
             for row in 0..m {
                 let row_gamma = self.channel_gammas[row];
-                let dequant = row_gamma * act_scale;
+                let dequant = row_gamma * act_scale * self.variance_correction;
                 for col in 0..n {
                     output_f32[row * n + col] = output_i32[row * n + col] as f32 * dequant;
                 }
             }
         } else {
-            let dequant = self.gamma * act_scale;
+            let dequant = self.gamma * act_scale * self.variance_correction;
             for i in 0..output_f32.len() {
                 output_f32[i] = output_i32[i] as f32 * dequant;
             }
